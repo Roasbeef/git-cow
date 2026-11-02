@@ -41,6 +41,8 @@ func TestSpecialFilesRefused(t *testing.T) {
 // TestAddSkipsSpecialFiles checks that a worktree made from a checkout with a
 // FIFO in an untracked directory succeeds and leaves the FIFO out.
 func TestAddSkipsSpecialFiles(t *testing.T) {
+	requireClone(t)
+
 	src := newRepo(t)
 	write(t, filepath.Join(src, "build", "keep.o"), "obj\n")
 
@@ -67,6 +69,8 @@ func TestAddSkipsSpecialFiles(t *testing.T) {
 // inode of the cloned file and not the source's. "git diff-files" would pass
 // either way because it rehashes, so the stat data is read directly.
 func TestAddIndexHoldsCloneInodes(t *testing.T) {
+	requireClone(t)
+
 	src := newRepo(t)
 
 	res, err := AddWorktree(context.Background(), AddOptions{

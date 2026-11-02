@@ -155,3 +155,25 @@ func names(t testing.TB, dir string) []string {
 
 	return out
 }
+
+// requireClone skips the test when the filesystem under t.TempDir() cannot
+// clone files, because the test checks behaviour of the cloning path. Without
+// cloning, add falls back to plain git worktree add, which other tests cover.
+func requireClone(t testing.TB) {
+	t.Helper()
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+
+	if err := os.WriteFile(src, []byte("probe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cloneFile(src, filepath.Join(dir, "dst")); err != nil {
+		if isUnsupported(err) {
+			t.Skipf("the filesystem under t.TempDir() cannot clone files: %v", err)
+		}
+
+		t.Fatal(err)
+	}
+}

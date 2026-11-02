@@ -46,6 +46,8 @@ var addModes = []struct {
 // along, the worktree is registered with Git and is clean, and a write on
 // one side stays on that side.
 func TestAddCarriesUntrackedFiles(t *testing.T) {
+	requireClone(t)
+
 	for _, mode := range addModes {
 		t.Run(mode.name, func(t *testing.T) {
 			src := newRepo(t)
@@ -110,6 +112,8 @@ func TestAddCarriesUntrackedFiles(t *testing.T) {
 // tracked files are those of that commit, as git worktree add gives, while the
 // untracked file from the source is kept.
 func TestAddMatchesCommitish(t *testing.T) {
+	requireClone(t)
+
 	for _, mode := range addModes {
 		t.Run(mode.name, func(t *testing.T) {
 			src := newRepo(t)
@@ -343,6 +347,8 @@ func TestAddWithoutCloningSupport(t *testing.T) {
 // TestAddFailureRollsBack fails the population and checks the worktree is
 // unregistered, the directory gone and the new branch deleted.
 func TestAddFailureRollsBack(t *testing.T) {
+	requireClone(t)
+
 	src := newRepo(t)
 	boom := errors.New("injected failure")
 
@@ -389,6 +395,8 @@ func TestAddRefusesDestinationInsideSource(t *testing.T) {
 
 // TestAddFromLinkedWorktree uses a linked worktree as the source.
 func TestAddFromLinkedWorktree(t *testing.T) {
+	requireClone(t)
+
 	src := newRepo(t)
 	first := filepath.Join(filepath.Dir(src), "first")
 	git(t, src, "worktree", "add", "-q", "-b", "one", first)
@@ -414,6 +422,8 @@ func TestAddFromLinkedWorktree(t *testing.T) {
 // whole-tree clone fails as unsupported, no further directory is scanned for
 // one. On Linux every directory would otherwise be walked an extra time.
 func TestAddScansOnceWhenTreeCloneUnsupported(t *testing.T) {
+	requireClone(t)
+
 	src := newRepo(t)
 
 	calls := 0
@@ -457,6 +467,8 @@ func ageFiles(t *testing.T, repo string) {
 // keep the source's modification time. A rewrite by the final reset would
 // give them the time of the add, and would copy their blocks.
 func TestAddKeepsClonesUnrewritten(t *testing.T) {
+	requireClone(t)
+
 	for _, mode := range addModes {
 		t.Run(mode.name, func(t *testing.T) {
 			src := newRepo(t)
@@ -489,6 +501,8 @@ func TestAddKeepsClonesUnrewritten(t *testing.T) {
 // TestAddRollbackLeavesOtherWorktrees checks a failed add does not prune the
 // record of an unrelated worktree whose directory is missing.
 func TestAddRollbackLeavesOtherWorktrees(t *testing.T) {
+	requireClone(t)
+
 	src := newRepo(t)
 	stale := filepath.Join(filepath.Dir(src), "stale")
 
