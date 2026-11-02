@@ -74,8 +74,17 @@ directory. These are refused, with exit status 2:
 
 - a linked worktree (`.git` is a file) or a symlinked `.git`;
 - a repository with `.git/objects/info/alternates`;
+- a repository with any linked worktree registered in `.git/worktrees`, since
+  the copy would list the host's worktree;
+- a symlink anywhere under `.git`, since a write through it could reach the
+  host;
+- a `core.worktree` setting or a `.git/commondir` file that makes Git in the
+  copy act on another path. This is found by the check after copying, so
+  the copy is built and then removed;
 - a destination that exists, or that is inside the template or contains it;
-- a tree holding a device, socket or FIFO.
+- a tree holding a device, socket or FIFO. This includes the socket that
+  Git's fsmonitor daemon leaves at `.git/fsmonitor--daemon.ipc`, so stop the
+  daemon in the template first.
 
 The tree is built in a hidden temporary directory next to `<dest>` and
 renamed into place as the last step with a rename that fails if `<dest>`
@@ -124,7 +133,9 @@ Further behavior:
 - If the filesystem cannot clone, `add` runs plain `git worktree add`, or
   exits 3 with `--require-cow`.
 - If anything fails after Git created the worktree, the worktree and any
-  branch made by `-b` are removed. `add` never runs `git worktree prune`.
+  branch made by `-b` are removed. A branch Git named after the path's
+  basename, when neither `-b` nor `-B` is given, is left behind, and an empty
+  directory given as `<path>` is removed. `add` never runs `git worktree prune`.
 - A commit-ish that tracks a path where the source has an untracked file
   replaces that file.
 
@@ -143,8 +154,10 @@ Further behavior:
 ## How cloning works
 
 On macOS, `copy` clones the whole tree with one `clonefile(2)` call through
-`golang.org/x/sys/unix`, with `CLONE_NOFOLLOW`. The call is atomic and does
-not follow symlinks. `add` clones each top-level directory that holds no
+`golang.org/x/sys/unix`, with `CLONE_NOFOLLOW`. The man page says the call is
+expected to be atomic and discourages cloning directory hierarchies. Nothing
+here depends on that, because the clone goes into a temporary directory that
+is renamed into place. The call does not follow symlinks. `add` clones each top-level directory that holds no
 submodule the same way, and single files otherwise.
 
 On Linux, git-cow walks the tree and clones each file with the `FICLONE`
@@ -194,6 +207,9 @@ idea of having Git create the worktree metadata with `--no-checkout` and
 then filling the directory with clones is shared by both tools.
 
 ### Features
+
+In this section `add.go` is `internal/worktree/add.go`, and `apfs_darwin.go` and
+`unsupported.go` are in `internal/clone/`, all in the git-worktree-apfs repository.
 
 | | git-worktree-apfs | git-cow |
 | --- | --- | --- |
