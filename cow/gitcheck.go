@@ -83,6 +83,10 @@ func verify(ctx context.Context, tree, wantHead string) error {
 		return fmt.Errorf("verifying copy: %w", err)
 	}
 
+	if err := verifyRoots(ctx, tree); err != nil {
+		return err
+	}
+
 	got, err := gitHead(ctx, tree)
 	if err != nil {
 		return fmt.Errorf("verifying copy: %w", err)
@@ -90,6 +94,50 @@ func verify(ctx context.Context, tree, wantHead string) error {
 
 	if got != wantHead {
 		return fmt.Errorf("verifying copy: HEAD is %q, template has %q", got, wantHead)
+	}
+
+	return nil
+}
+
+// verifyRoots checks that Git, run in tree, treats tree as its working tree
+// and tree/.git as its common directory. A core.worktree setting or a
+// commondir file inherited from the template would otherwise point the
+// copy's Git at a host path.
+func verifyRoots(ctx context.Context, tree string) error {
+	cmd := exec.CommandContext(ctx, "git",
+		"-c", "core.hooksPath=/dev/null",
+		"-c", "core.fsmonitor=false",
+		"-C", tree,
+		"rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir",
+	)
+	cmd.Env = gitEnv()
+
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("verifying copy: git rev-parse: %w", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) != 2 {
+		return fmt.Errorf("verifying copy: unexpected rev-parse output %q", out)
+	}
+
+	// The temporary tree may sit behind a symlink, such as /var on macOS,
+	// so compare resolved paths.
+	for i, want := range []string{tree, filepath.Join(tree, ".git")} {
+		got, err := filepath.EvalSymlinks(lines[i])
+		if err != nil {
+			return fmt.Errorf("verifying copy: %w", err)
+		}
+
+		resolved, err := filepath.EvalSymlinks(want)
+		if err != nil {
+			return fmt.Errorf("verifying copy: %w", err)
+		}
+
+		if got != resolved {
+			return fmt.Errorf("verifying copy: Git resolves %q where %q is expected", got, resolved)
+		}
 	}
 
 	return nil

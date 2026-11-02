@@ -490,6 +490,30 @@ func TestRefusals(t *testing.T) {
 		refused(t, err)
 	})
 
+	t.Run("template has linked worktrees", func(t *testing.T) {
+		tpl := newRepo(t)
+		git(t, tpl, "worktree", "add", "-q", "-b", "hostwt", filepath.Join(filepath.Dir(tpl), "hostwt"))
+
+		_, err := Copy(context.Background(), tpl, filepath.Join(filepath.Dir(tpl), "out"), Options{})
+		refused(t, err)
+	})
+
+	t.Run("symlink under .git", func(t *testing.T) {
+		tpl := newRepo(t)
+		outside := filepath.Join(t.TempDir(), "hooks")
+
+		if err := os.Mkdir(outside, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.Symlink(outside, filepath.Join(tpl, ".git", "hooks-link")); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := Copy(context.Background(), tpl, filepath.Join(filepath.Dir(tpl), "out"), Options{})
+		refused(t, err)
+	})
+
 	t.Run("destination parent missing", func(t *testing.T) {
 		tpl := newRepo(t)
 
@@ -572,4 +596,63 @@ func TestDestinationRaceIsRefused(t *testing.T) {
 	if got := names(t, dest); len(got) != 0 {
 		t.Fatalf("the competing directory was replaced, now holds %v", got)
 	}
+}
+
+// TestCopyRefusesForeignWorktree checks that a template whose config points
+// Git at another working tree, or whose Git directory names another common
+// directory, does not produce a copy that acts on the host.
+func TestCopyRefusesForeignWorktree(t *testing.T) {
+	cases := map[string]func(t *testing.T, tpl string){
+		"core.worktree": func(t *testing.T, tpl string) {
+			git(t, tpl, "config", "core.worktree", t.TempDir())
+		},
+		"commondir": func(t *testing.T, tpl string) {
+			other := newRepo(t)
+			write(t, filepath.Join(tpl, ".git", "commondir"), filepath.Join(other, ".git")+"\n")
+		},
+	}
+
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			tpl := newRepo(t)
+			setup(t, tpl)
+
+			parent := filepath.Dir(tpl)
+			dest := filepath.Join(parent, "copy")
+
+			if _, err := Copy(context.Background(), tpl, dest, Options{}); err == nil {
+				t.Fatal("the copy was made")
+			}
+
+			assertNothingLeft(t, parent, dest, "tpl")
+		})
+	}
+}
+
+// TestCancelLeavesNothing cancels the context partway through a walk, as a
+// signal handler does, and checks nothing is left behind.
+func TestCancelLeavesNothing(t *testing.T) {
+	tpl := newRepo(t)
+	parent := filepath.Dir(tpl)
+	dest := filepath.Join(parent, "copy")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	n := 0
+	perFileHook = func(string) error {
+		if n++; n == 4 {
+			cancel()
+		}
+
+		return nil
+	}
+
+	t.Cleanup(func() { perFileHook = nil })
+
+	if _, err := Copy(ctx, tpl, dest, Options{forceWalk: true}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+
+	assertNothingLeft(t, parent, dest, "tpl")
 }
