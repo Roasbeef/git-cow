@@ -119,7 +119,7 @@ func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
 		dest = filepath.Join(absDir(opts.Dir), dest)
 	}
 
-	dest = filepath.Clean(dest)
+	dest = resolveLoose(filepath.Clean(dest))
 
 	if within(src, dest) {
 		return AddResult{}, refusef("destination %q is inside the source checkout", opts.Path)
@@ -385,6 +385,25 @@ func probeCoW(ctx context.Context, src, dest string, forceNo bool) (bool, error)
 	}
 
 	return false, fmt.Errorf("probing for clone support: %w", err)
+}
+
+// resolveLoose resolves symlinks in the part of p that exists and keeps the
+// rest as written, so a path that does not exist yet can be compared with
+// the resolved paths Git reports.
+func resolveLoose(p string) string {
+	rest := ""
+
+	for cur := p; ; cur = filepath.Dir(cur) {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(resolved, rest)
+		}
+
+		if filepath.Dir(cur) == cur {
+			return p
+		}
+
+		rest = filepath.Join(filepath.Base(cur), rest)
+	}
 }
 
 // absDir returns dir as an absolute path, treating "" as the current directory.
