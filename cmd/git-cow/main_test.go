@@ -170,12 +170,13 @@ func TestAddInteroperatesWithGit(t *testing.T) {
 
 	t.Logf("add used method %q", added.Method)
 
-	if got := added.Method; got == cow.MethodWorktree {
-		t.Skip("the filesystem under t.TempDir() cannot clone files; add fell back to plain git")
-	}
-
-	if body, err := os.ReadFile(filepath.Join(added.Path, "build", "o")); err != nil || string(body) != "o\n" {
-		t.Errorf("ignored artifact: %q, %v", body, err)
+	// Only the ignored artifact needs a clone. Plain git does not copy it,
+	// so on a filesystem that cannot clone the rest of the test still runs
+	// against the plain-worktree fallback.
+	if added.Method != cow.MethodWorktree {
+		if body, err := os.ReadFile(filepath.Join(added.Path, "build", "o")); err != nil || string(body) != "o\n" {
+			t.Errorf("ignored artifact: %q, %v", body, err)
+		}
 	}
 
 	// git sees what git-cow made, and git-cow list matches git worktree list.

@@ -5,8 +5,10 @@ package cow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -58,5 +60,29 @@ func TestAddSkipsSpecialFiles(t *testing.T) {
 
 	if _, err := os.Lstat(filepath.Join(dest, "build", "pipe")); err == nil {
 		t.Error("the FIFO was copied")
+	}
+}
+
+// TestAddIndexHoldsCloneInodes checks the new worktree's index records the
+// inode of the cloned file and not the source's. "git diff-files" would pass
+// either way because it rehashes, so the stat data is read directly.
+func TestAddIndexHoldsCloneInodes(t *testing.T) {
+	src := newRepo(t)
+
+	res, err := AddWorktree(context.Background(), AddOptions{
+		Dir: src, Path: filepath.Join(filepath.Dir(src), "wt"), Branch: "feat",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var st unix.Stat_t
+	if err := unix.Stat(filepath.Join(res.Path, "README.md"), &st); err != nil {
+		t.Fatal(err)
+	}
+
+	out := git(t, res.Path, "ls-files", "--debug", "README.md")
+	if want := fmt.Sprintf("ino: %d", st.Ino); !strings.Contains(out, want) {
+		t.Errorf("index stat data lacks %q:\n%s", want, out)
 	}
 }
