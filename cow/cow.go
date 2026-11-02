@@ -78,6 +78,9 @@ var (
 	// duplicated. A non-nil error aborts the copy.
 	perFileHook func(srcPath string) error
 
+	// cloneTree is the whole-tree clone, replaceable by tests.
+	cloneTree = wholeTreeClone
+
 	// beforeRenameHook runs after the copy is built and verified but
 	// before it is renamed into place.
 	beforeRenameHook func(tree string) error
@@ -159,7 +162,7 @@ func build(ctx context.Context, tpl, tree string, stats treeStats,
 	// atomic. When it is unsupported we fall through to the walk, which
 	// decides per file whether cloning works.
 	if !opts.forceWalk && !opts.forceNoCoW {
-		err := wholeTreeClone(tpl, tree)
+		err := cloneTree(tpl, tree)
 		switch {
 		case err == nil:
 			return MethodClonefile, nil

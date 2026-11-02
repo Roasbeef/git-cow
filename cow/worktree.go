@@ -189,10 +189,12 @@ func populateWorktree(ctx context.Context, src, srcHead, dest string,
 	}
 
 	// The source index describes exactly these files, so copying it gives
-	// the new worktree stat data to compare against and spares the first
-	// "git status" from hashing every tracked file. The clones share the
-	// source's mtime and size but not its inode or ctime, so the refresh
-	// compares only the first two and then stores the clones' own values.
+	// the new worktree an index to compare against. The clones share the
+	// source's mtime and size but not its inode or ctime, so the refresh and
+	// the reset below compare only the first two. The index still holds the
+	// source's inode numbers after them. The final "git status" runs with
+	// Git's default settings, rehashes the files and stores the clones' own
+	// stat values, so later commands are fast.
 	if err := copyIndex(ctx, src, dest); err != nil {
 		return AddResult{}, err
 	}

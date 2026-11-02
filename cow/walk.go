@@ -143,7 +143,7 @@ func (w *walker) cloneWhole(from, to, rel string) (bool, error) {
 		return false, err
 	}
 
-	err = wholeTreeClone(from, to)
+	err = cloneTree(from, to)
 	switch {
 	case err == nil:
 		w.files += stats.files
@@ -153,6 +153,10 @@ func (w *walker) cloneWhole(from, to, rel string) (bool, error) {
 		return true, nil
 
 	case isUnsupported(err):
+		// Every later directory would fail the same way, so stop scanning
+		// them for a whole-tree clone.
+		w.treeClone = false
+
 		return false, nil
 	}
 

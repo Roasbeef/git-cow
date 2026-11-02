@@ -410,19 +410,27 @@ func TestAddFromLinkedWorktree(t *testing.T) {
 	}
 }
 
-// TestAddCopiesIndexStat checks the new worktree's index has the clones' own
-// stat data, so the first status does not report anything and does not need
-// to hash files: after the add, nothing is modified.
-func TestAddCopiesIndexStat(t *testing.T) {
+// TestAddScansOnceWhenTreeCloneUnsupported checks that after the first
+// whole-tree clone fails as unsupported, no further directory is scanned for
+// one. On Linux every directory would otherwise be walked an extra time.
+func TestAddScansOnceWhenTreeCloneUnsupported(t *testing.T) {
 	src := newRepo(t)
 
-	res, err := addTo(t, src, "wt", AddOptions{Branch: "feat"})
-	if err != nil {
+	calls := 0
+	cloneTree = func(string, string) error {
+		calls++
+
+		return errNoCoW
+	}
+
+	t.Cleanup(func() { cloneTree = wholeTreeClone })
+
+	if _, err := addTo(t, src, "wt", AddOptions{Branch: "feat"}); err != nil {
 		t.Fatal(err)
 	}
 
-	if out := git(t, res.Path, "diff-files", "--name-only"); out != "" {
-		t.Errorf("git diff-files reports %q", out)
+	if calls != 1 {
+		t.Errorf("whole-tree clone attempted %d times, want 1", calls)
 	}
 }
 
