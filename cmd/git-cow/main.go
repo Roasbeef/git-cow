@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/roasbeef/git-cow/cow"
 )
@@ -41,10 +42,16 @@ commands:
 `
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signalContext()
 	defer stop()
 
 	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// signalContext returns a context cancelled by SIGINT or SIGTERM, so a copy
+// that is interrupted or terminated removes its temporary directory.
+func signalContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 }
 
 // run executes one command line and returns the process exit status.
