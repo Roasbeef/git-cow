@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // addTo runs AddWorktree from src with the given options and a destination
@@ -422,5 +423,89 @@ func TestAddCopiesIndexStat(t *testing.T) {
 
 	if out := git(t, res.Path, "diff-files", "--name-only"); out != "" {
 		t.Errorf("git diff-files reports %q", out)
+	}
+}
+
+// ageFiles moves the modification time of every tracked file an hour into the
+// past and refreshes the index. Files written moments ago are "racily clean"
+// to Git, which then rehashes them and hides a stat mismatch; files of a
+// settled checkout are not.
+func ageFiles(t *testing.T, repo string) {
+	t.Helper()
+
+	past := time.Now().Add(-time.Hour)
+
+	for _, f := range strings.Fields(git(t, repo, "ls-files")) {
+		if err := os.Chtimes(filepath.Join(repo, f), past, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	git(t, repo, "update-index", "--refresh", "-q")
+	git(t, repo, "status", "--porcelain")
+}
+
+// TestAddKeepsClonesUnrewritten checks the tracked files in the new worktree
+// keep the source's modification time. A rewrite by the final reset would
+// give them the time of the add, and would copy their blocks.
+func TestAddKeepsClonesUnrewritten(t *testing.T) {
+	for _, mode := range addModes {
+		t.Run(mode.name, func(t *testing.T) {
+			src := newRepo(t)
+			ageFiles(t, src)
+
+			res, err := addTo(t, src, "wt", AddOptions{Branch: "feat", forceWalk: mode.opts.forceWalk})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for _, f := range []string{"README.md", "src/a.txt", "run.sh"} {
+				a, err := os.Stat(filepath.Join(src, f))
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				b, err := os.Stat(filepath.Join(res.Path, f))
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if !a.ModTime().Equal(b.ModTime()) {
+					t.Errorf("%s has mtime %v in the worktree and %v in the source", f, b.ModTime(), a.ModTime())
+				}
+			}
+		})
+	}
+}
+
+// TestAddRollbackLeavesOtherWorktrees checks a failed add does not prune the
+// record of an unrelated worktree whose directory is missing.
+func TestAddRollbackLeavesOtherWorktrees(t *testing.T) {
+	src := newRepo(t)
+	stale := filepath.Join(filepath.Dir(src), "stale")
+
+	git(t, src, "worktree", "add", "-q", "-b", "stale", stale)
+
+	if err := os.RemoveAll(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	n := 0
+	perFileHook = func(string) error {
+		if n++; n == 2 {
+			return errors.New("injected failure")
+		}
+
+		return nil
+	}
+
+	t.Cleanup(func() { perFileHook = nil })
+
+	if _, err := addTo(t, src, "wt", AddOptions{forceWalk: true, Branch: "feat"}); err == nil {
+		t.Fatal("expected a failure")
+	}
+
+	if out := git(t, src, "worktree", "list", "--porcelain"); !strings.Contains(out, "stale") {
+		t.Errorf("the unrelated worktree record was pruned:\n%s", out)
 	}
 }

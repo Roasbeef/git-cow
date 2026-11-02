@@ -202,8 +202,12 @@ func populateWorktree(ctx context.Context, src, srcHead, dest string,
 
 	// With the index at the source's HEAD, a hard reset to the worktree's
 	// own HEAD rewrites exactly the files that differ between the two
-	// commits, and removes the ones the target commit does not have.
-	if err := runGit(ctx, dest, "reset", "--hard", "-q"); err != nil {
+	// commits, and removes the ones the target commit does not have. The
+	// reset must use the same relaxed stat comparison as the refresh. With
+	// Git's default it would see a different inode on every clone and
+	// rewrite the whole tree, which defeats the cloning.
+	if err := runGit(ctx, dest, "-c", "core.checkStat=minimal", "-c", "core.trustctime=false",
+		"reset", "--hard", "-q"); err != nil {
 		return AddResult{}, err
 	}
 
@@ -284,16 +288,39 @@ func addArgs(opts AddOptions, dest string, noCheckout bool) []string {
 }
 
 // rollbackAdd undoes a half-made worktree and the branch created for it.
+//
+// It never runs "git worktree prune", which would also delete the records of
+// unrelated worktrees whose directories happen to be missing. If Git cannot
+// remove the worktree, only this worktree's own record is deleted.
 func rollbackAdd(src, dest string, opts AddOptions) {
 	ctx := context.Background()
 
-	_ = runGit(ctx, src, "worktree", "remove", "--force", dest)
+	if err := runGit(ctx, src, "worktree", "remove", "--force", dest); err != nil {
+		if record := worktreeRecord(dest); record != "" {
+			_ = os.RemoveAll(record)
+		}
+	}
+
 	_ = os.RemoveAll(dest)
-	_ = runGit(ctx, src, "worktree", "prune")
 
 	if opts.Branch != "" {
 		_ = runGit(ctx, src, "branch", "-D", opts.Branch)
 	}
+}
+
+// worktreeRecord returns the administrative directory named by dest/.git.
+func worktreeRecord(dest string) string {
+	data, err := os.ReadFile(filepath.Join(dest, ".git"))
+	if err != nil {
+		return ""
+	}
+
+	dir, ok := strings.CutPrefix(strings.TrimSpace(string(data)), "gitdir: ")
+	if !ok {
+		return ""
+	}
+
+	return dir
 }
 
 // requireClean refuses a source whose tracked files differ from HEAD.
