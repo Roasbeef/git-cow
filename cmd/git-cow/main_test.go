@@ -101,7 +101,7 @@ func TestCopyJSONAndExitCodes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, key := range []string{"method", "files", "bytes", "elapsed_ms", "head"} {
+	for _, key := range []string{"method", "path", "files", "bytes", "elapsed_ms", "head"} {
 		if _, ok := got[key]; !ok {
 			t.Errorf("missing key %q in %s", key, out)
 		}
@@ -113,6 +113,18 @@ func TestCopyJSONAndExitCodes(t *testing.T) {
 
 	if code, out, _ := cli(t, parent, "copy", "main", "copy2"); code != 0 || !strings.HasPrefix(out, "copied ") {
 		t.Errorf("human output: status %d, %q", code, out)
+	}
+
+	// Flags after positional arguments work on copy as they do on add.
+	if code, out, errOut := cli(t, parent, "copy", "main", "copy-trailing", "--json"); code != 0 || !strings.Contains(out, "\"path\"") {
+		t.Errorf("trailing --json: status %d, out=%q, err=%q", code, out, errOut)
+	}
+
+	// --help on copy and add prints usage and exits 0.
+	for _, sub := range []string{"copy", "add"} {
+		if code, out, _ := cli(t, parent, sub, "--help"); code != 0 || !strings.HasPrefix(out, "usage: ") {
+			t.Errorf("%s --help: status %d, %q", sub, code, out)
+		}
 	}
 
 	cases := []struct {
@@ -304,5 +316,42 @@ func TestAddExitStatuses(t *testing.T) {
 
 	if code, _, errOut := cli(t, src, "add", "-b", "dirty", "../dirty"); code != exitRefused {
 		t.Errorf("dirty source: status %d (%s)", code, errOut)
+	}
+}
+
+// TestWorktreePassthroughAndFlags covers move, lock, unlock, repair and the
+// additional add flags (-q, --lock, --reason, --).
+func TestWorktreePassthroughAndFlags(t *testing.T) {
+	src := newRepo(t)
+	parent := filepath.Dir(src)
+
+	code, out, errOut := cli(t, src, "add", "-q", "--lock", "--reason=pinned", "-b", "feat", "--", "../wt")
+	if code != 0 || out != "" {
+		t.Fatalf("add -q --lock: status %d, out=%q, err=%s", code, out, errOut)
+	}
+
+	// A locked worktree cannot be moved or removed without unlocking.
+	if code, _, _ := cli(t, src, "remove", "../wt"); code == 0 {
+		t.Fatal("remove succeeded on a locked worktree")
+	}
+
+	if code, _, errOut := cli(t, src, "unlock", "../wt"); code != 0 {
+		t.Fatalf("unlock: %d %s", code, errOut)
+	}
+
+	if code, _, errOut := cli(t, src, "move", "../wt", "../wt-moved"); code != 0 {
+		t.Fatalf("move: %d %s", code, errOut)
+	}
+
+	if code, _, errOut := cli(t, src, "lock", "../wt-moved"); code != 0 {
+		t.Fatalf("lock: %d %s", code, errOut)
+	}
+
+	if code, _, errOut := cli(t, src, "unlock", "../wt-moved"); code != 0 {
+		t.Fatalf("unlock: %d %s", code, errOut)
+	}
+
+	if code, _, errOut := cli(t, src, "repair", filepath.Join(parent, "wt-moved")); code != 0 {
+		t.Fatalf("repair: %d %s", code, errOut)
 	}
 }

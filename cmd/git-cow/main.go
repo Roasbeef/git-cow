@@ -2,20 +2,21 @@
 // worktrees.
 //
 // "copy" makes an independent repository, which is the safe choice for code
-// you do not trust. "add", "list", "remove" and "prune" mirror
-// "git worktree" and share the source's Git directory.
+// you do not trust. "add", "list", "remove", "prune", "move", "lock",
+// "unlock" and "repair" mirror "git worktree" and share the source's Git
+// directory.
 package main
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/roasbeef/git-cow/cow"
@@ -34,12 +35,25 @@ const usage = `usage: git-cow [-C <dir>] <command> [options]
 commands:
   copy [--require-cow] [--json] <template> <dest>
         make an independent repository that shares disk blocks
-  add [-b <branch>] [-B <branch>] [--detach] [--force] [--require-cow] [--json] <path> [<commit-ish>]
+  add [-b <branch>] [-B <branch>] [-d|--detach] [-f|--force] [-q|--quiet]
+      [--lock [--reason <string>]] [--track|--no-track]
+      [--guess-remote|--no-guess-remote] [--require-cow] [--json]
+      <path> [<commit-ish>]
         make a linked worktree whose files are clones of this checkout
-  list [--porcelain]      same as git worktree list
-  remove [--force] <path> same as git worktree remove
-  prune                   same as git worktree prune
+  list [--porcelain]         same as git worktree list
+  remove [--force] <path>    same as git worktree remove
+  prune                      same as git worktree prune
+  move <worktree> <new-path> same as git worktree move
+  lock <worktree>            same as git worktree lock
+  unlock <worktree>          same as git worktree unlock
+  repair [<path>...]         same as git worktree repair
 `
+
+const copyUsage = "usage: git-cow copy [--require-cow] [--json] <template> <dest>\n"
+
+const addUsage = "usage: git-cow add [-b <branch>] [-B <branch>] [--detach] " +
+	"[--force] [--quiet] [--lock [--reason <string>]] [--track|--no-track] " +
+	"[--guess-remote|--no-guess-remote] [--require-cow] [--json] <path> [<commit-ish>]\n"
 
 func main() {
 	ctx, stop := signalContext()
@@ -58,8 +72,28 @@ func signalContext() (context.Context, context.CancelFunc) {
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	dir := "."
 
-	if len(args) >= 2 && args[0] == "-C" {
-		dir, args = args[1], args[2:]
+	for len(args) > 0 {
+		if args[0] == "-C" {
+			if len(args) < 2 {
+				_, _ = fmt.Fprint(stderr, "git-cow: -C needs a directory\n")
+
+				return exitError
+			}
+
+			dir = inDir(dir, args[1])
+			args = args[2:]
+
+			continue
+		}
+
+		if after, ok := strings.CutPrefix(args[0], "-C"); ok && after != "" {
+			dir = inDir(dir, after)
+			args = args[1:]
+
+			continue
+		}
+
+		break
 	}
 
 	if len(args) == 0 {
@@ -77,7 +111,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	case "add":
 		return runAdd(ctx, dir, rest, stdout, stderr)
 
-	case "list", "remove", "prune":
+	case "list", "remove", "prune", "move", "lock", "unlock", "repair":
 		return cow.Passthrough(ctx, dir, sub, rest, stdout, stderr)
 
 	case "-h", "--help", "help":
@@ -91,49 +125,76 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return exitError
 }
 
-// copyJSON is the single line "copy --json" prints.
-type copyJSON struct {
+// resultJSON is the single line "copy --json" and "add --json" print.
+type resultJSON struct {
 	Method    string `json:"method"`
+	Path      string `json:"path"`
 	Files     int    `json:"files"`
 	Bytes     int64  `json:"bytes"`
 	ElapsedMS int64  `json:"elapsed_ms"`
 	Head      string `json:"head"`
 }
 
-// addJSON is the single line "add --json" prints.
-type addJSON struct {
-	copyJSON
-	Path string `json:"path"`
-}
-
 // runCopy implements "git-cow copy".
 func runCopy(ctx context.Context, dir string, args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("copy", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	var (
+		requireCOW bool
+		asJSON     bool
+		positional []string
+	)
 
-	requireCOW := fs.Bool("require-cow", false, "fail instead of falling back to a plain copy")
-	asJSON := fs.Bool("json", false, "print one JSON line")
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
 
-	if err := fs.Parse(args); err != nil {
+		switch arg {
+		case "-h", "--help":
+			_, _ = fmt.Fprint(stdout, copyUsage)
+
+			return exitOK
+
+		case "--require-cow":
+			requireCOW = true
+
+		case "--json":
+			asJSON = true
+
+		case "--":
+			positional = append(positional, args[i+1:]...)
+			i = len(args)
+
+		default:
+			if len(arg) > 1 && arg[0] == '-' {
+				_, _ = fmt.Fprintf(stderr, "git-cow copy: unsupported option %q\n", arg)
+
+				return exitError
+			}
+
+			positional = append(positional, arg)
+		}
+	}
+
+	if len(positional) != 2 {
+		_, _ = fmt.Fprint(stderr, copyUsage)
+
 		return exitError
 	}
 
-	if fs.NArg() != 2 {
-		_, _ = fmt.Fprint(stderr, "usage: git-cow copy [--require-cow] [--json] <template> <dest>\n")
+	template, dest := inDir(dir, positional[0]), inDir(dir, positional[1])
 
-		return exitError
-	}
-
-	template, dest := inDir(dir, fs.Arg(0)), inDir(dir, fs.Arg(1))
-
-	res, err := cow.Copy(ctx, template, dest, cow.Options{RequireCOW: *requireCOW})
+	res, err := cow.Copy(ctx, template, dest, cow.Options{RequireCOW: requireCOW})
 	if err != nil {
 		return fail(stderr, err)
 	}
 
-	j := copyJSON{res.Method, res.Files, res.Bytes, res.Elapsed.Milliseconds(), res.Head}
-	if *asJSON {
-		return printJSON(stdout, stderr, j)
+	if asJSON {
+		return printJSON(stdout, stderr, resultJSON{
+			Method:    res.Method,
+			Path:      res.Path,
+			Files:     res.Files,
+			Bytes:     res.Bytes,
+			ElapsedMS: res.Elapsed.Milliseconds(),
+			Head:      res.Head,
+		})
 	}
 
 	_, _ = fmt.Fprintf(stdout, "copied %d files (%d bytes) by %s in %dms to %s\n",
@@ -152,8 +213,13 @@ func runAdd(ctx context.Context, dir string, args []string, stdout, stderr io.Wr
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 
-		switch arg {
-		case "-b", "-B":
+		switch {
+		case arg == "-h" || arg == "--help":
+			_, _ = fmt.Fprint(stdout, addUsage)
+
+			return exitOK
+
+		case arg == "-b" || arg == "-B":
 			if i+1 >= len(args) {
 				_, _ = fmt.Fprintf(stderr, "git-cow add: %s needs a branch name\n", arg)
 
@@ -167,17 +233,52 @@ func runAdd(ctx context.Context, dir string, args []string, stdout, stderr io.Wr
 				opts.ResetBranch = args[i]
 			}
 
-		case "--detach", "-d":
+		case arg == "--detach" || arg == "-d":
 			opts.Detach = true
 
-		case "--force", "-f":
+		case arg == "--force" || arg == "-f":
 			opts.Force = true
 
-		case "--require-cow":
+		case arg == "--quiet" || arg == "-q":
+			opts.Quiet = true
+
+		case arg == "--lock":
+			opts.Lock = true
+
+		case arg == "--reason":
+			if i+1 >= len(args) {
+				_, _ = fmt.Fprint(stderr, "git-cow add: --reason needs a message\n")
+
+				return exitError
+			}
+
+			i++
+			opts.LockReason = args[i]
+
+		case strings.HasPrefix(arg, "--reason="):
+			opts.LockReason = strings.TrimPrefix(arg, "--reason=")
+
+		case arg == "--track":
+			opts.Track = true
+
+		case arg == "--no-track":
+			opts.NoTrack = true
+
+		case arg == "--guess-remote":
+			opts.GuessRemote = true
+
+		case arg == "--no-guess-remote":
+			opts.NoGuessRemote = true
+
+		case arg == "--require-cow":
 			opts.RequireCOW = true
 
-		case "--json":
+		case arg == "--json":
 			asJSON = true
+
+		case arg == "--":
+			positional = append(positional, args[i+1:]...)
+			i = len(args)
 
 		default:
 			if len(arg) > 1 && arg[0] == '-' {
@@ -191,8 +292,7 @@ func runAdd(ctx context.Context, dir string, args []string, stdout, stderr io.Wr
 	}
 
 	if len(positional) < 1 || len(positional) > 2 {
-		_, _ = fmt.Fprint(stderr, "usage: git-cow add [-b <branch>] [-B <branch>] [--detach] "+
-			"[--force] [--require-cow] [--json] <path> [<commit-ish>]\n")
+		_, _ = fmt.Fprint(stderr, addUsage)
 
 		return exitError
 	}
@@ -208,14 +308,20 @@ func runAdd(ctx context.Context, dir string, args []string, stdout, stderr io.Wr
 	}
 
 	if asJSON {
-		return printJSON(stdout, stderr, addJSON{
-			copyJSON{res.Method, res.Files, res.Bytes, res.Elapsed.Milliseconds(), res.Head},
-			res.Path,
+		return printJSON(stdout, stderr, resultJSON{
+			Method:    res.Method,
+			Path:      res.Path,
+			Files:     res.Files,
+			Bytes:     res.Bytes,
+			ElapsedMS: res.Elapsed.Milliseconds(),
+			Head:      res.Head,
 		})
 	}
 
-	_, _ = fmt.Fprintf(stdout, "created worktree %s by %s in %dms at %.12s\n",
-		res.Path, res.Method, res.Elapsed.Milliseconds(), res.Head)
+	if !opts.Quiet {
+		_, _ = fmt.Fprintf(stdout, "created worktree %s by %s in %dms at %.12s\n",
+			res.Path, res.Method, res.Elapsed.Milliseconds(), res.Head)
+	}
 
 	return exitOK
 }
