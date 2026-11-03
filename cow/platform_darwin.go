@@ -9,6 +9,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Platform capabilities for whole-tree and per-file cloning.
+const (
+	hasWholeTreeClone  = true
+	clonePreservesMeta = true
+	methodFileClone    = MethodClonefile
+)
+
 // errNoCoW marks a clone attempt that the platform cannot perform.
 var errNoCoW = unix.ENOTSUP
 
@@ -61,4 +68,24 @@ func lchtimes(path string, t time.Time) error {
 	ts := []unix.Timespec{unix.NsecToTimespec(t.UnixNano()), unix.NsecToTimespec(t.UnixNano())}
 
 	return unix.UtimesNanoAt(unix.AT_FDCWD, path, ts, unix.AT_SYMLINK_NOFOLLOW)
+}
+
+// statIndexFields reads the Git index stat fields of path without following symlinks.
+func statIndexFields(path string) (indexStat, bool) {
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
+		return indexStat{}, false
+	}
+
+	return indexStat{
+		ctimeSec:  uint32(st.Ctim.Sec),
+		ctimeNsec: uint32(st.Ctim.Nsec),
+		mtimeSec:  uint32(st.Mtim.Sec),
+		mtimeNsec: uint32(st.Mtim.Nsec),
+		dev:       uint32(st.Dev),
+		ino:       uint32(st.Ino),
+		uid:       uint32(st.Uid),
+		gid:       uint32(st.Gid),
+		size:      uint32(st.Size),
+	}, true
 }

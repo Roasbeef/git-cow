@@ -31,6 +31,11 @@ type walker struct {
 	// with one whole-tree call where the platform has one.
 	treeClone bool
 
+	// fileCloneUnsupported is set once cloneFile reports that the
+	// filesystem cannot clone files, so later files go straight to a byte
+	// copy instead of retrying.
+	fileCloneUnsupported bool
+
 	// copied counts files that fell back to a byte copy.
 	copied int
 
@@ -41,6 +46,19 @@ type walker struct {
 	// not known up front.
 	files int
 	bytes int64
+}
+
+// method reports how the walker duplicated files.
+func (w *walker) method() string {
+	if w.copied > 0 || w.opts.forceNoCoW {
+		return MethodCopy
+	}
+
+	if w.wholeTrees > 0 {
+		return MethodClonefile
+	}
+
+	return methodFileClone
 }
 
 // copyDir recreates directory src at dst and everything beneath it.
@@ -138,7 +156,21 @@ func (w *walker) cloneWhole(from, to, rel string) (bool, error) {
 		return false, nil
 	}
 
-	stats, special, err := scanTree(from, nil)
+	stats, special, err := scanTree(from, func(p string, m fs.FileMode) error {
+		if m&fs.ModeSymlink != 0 || !w.skipSpecial {
+			return nil
+		}
+
+		if subRel, relErr := filepath.Rel(from, p); relErr == nil {
+			if w.skip == nil {
+				w.skip = make(map[string]struct{})
+			}
+
+			w.skip[path.Join(rel, filepath.ToSlash(subRel))] = struct{}{}
+		}
+
+		return nil
+	})
 	if err != nil || special > 0 {
 		return false, err
 	}
@@ -212,12 +244,15 @@ func (w *walker) copyFile(from, to string) error {
 	}
 
 	err = errNoCoW
-	if !w.opts.forceNoCoW {
+	if !w.opts.forceNoCoW && !w.fileCloneUnsupported {
 		err = cloneFile(from, to)
 	}
 
 	switch {
 	case err == nil:
+		if clonePreservesMeta {
+			return nil
+		}
 
 	case !isUnsupported(err):
 		return err
@@ -226,10 +261,14 @@ func (w *walker) copyFile(from, to string) error {
 		return fmt.Errorf("%w: cloning %q: %v", ErrNoCoW, from, err)
 
 	default:
-		// The failed clone must not leave a partial destination behind
-		// before the byte copy creates it exclusively.
-		if rmErr := os.Remove(to); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
-			return rmErr
+		if !w.fileCloneUnsupported {
+			w.fileCloneUnsupported = true
+
+			// The failed clone must not leave a partial destination behind
+			// before the byte copy creates it exclusively.
+			if rmErr := os.Remove(to); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+				return rmErr
+			}
 		}
 
 		if err := copyBytes(from, to); err != nil {

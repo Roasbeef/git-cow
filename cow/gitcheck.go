@@ -83,6 +83,13 @@ func verify(ctx context.Context, tree, wantHead string) error {
 		return fmt.Errorf("verifying copy: %w", err)
 	}
 
+	worktrees := filepath.Join(tree, ".git", "worktrees")
+	if _, err := os.Lstat(worktrees); err == nil {
+		return errors.New("verifying copy: worktrees directory present")
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("verifying copy: %w", err)
+	}
+
 	if err := verifyRoots(ctx, tree); err != nil {
 		return err
 	}
@@ -136,7 +143,7 @@ func verifyRoots(ctx context.Context, tree string) error {
 		}
 
 		if got != resolved {
-			return fmt.Errorf("verifying copy: Git resolves %q where %q is expected", got, resolved)
+			return refusef("Git resolves %q where %q is expected", got, resolved)
 		}
 	}
 

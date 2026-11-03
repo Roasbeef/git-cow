@@ -59,6 +59,9 @@ type Result struct {
 	// Method is one of MethodClonefile, MethodReflink or MethodCopy.
 	Method string
 
+	// Path is the absolute path of the new repository.
+	Path string
+
 	// Files is the number of regular files in the copy.
 	Files int
 
@@ -103,6 +106,10 @@ func Copy(ctx context.Context, template, dest string, opts Options) (Result, err
 		return Result{}, err
 	}
 
+	if err := verifyRoots(ctx, tpl); err != nil {
+		return Result{}, err
+	}
+
 	head, err := gitHead(ctx, tpl)
 	if err != nil {
 		return Result{}, fmt.Errorf("reading template HEAD: %w", err)
@@ -131,6 +138,8 @@ func Copy(ctx context.Context, template, dest string, opts Options) (Result, err
 		return Result{}, err
 	}
 
+	refreshIndexStats(tree, filepath.Join(tree, ".git", "index"), tpl)
+
 	if err := verify(ctx, tree, head); err != nil {
 		return Result{}, err
 	}
@@ -147,6 +156,7 @@ func Copy(ctx context.Context, template, dest string, opts Options) (Result, err
 
 	return Result{
 		Method:  method,
+		Path:    dst,
 		Files:   stats.files,
 		Bytes:   stats.bytes,
 		Elapsed: time.Since(start),
@@ -161,10 +171,12 @@ func build(ctx context.Context, tpl, tree string, stats treeStats,
 	// One clonefile(2) of the whole tree is the fastest path and is
 	// atomic. When it is unsupported we fall through to the walk, which
 	// decides per file whether cloning works.
-	if !opts.forceWalk && !opts.forceNoCoW {
+	if hasWholeTreeClone && !opts.forceWalk && !opts.forceNoCoW {
 		err := cloneTree(tpl, tree)
 		switch {
 		case err == nil:
+			detachCopyGitDir(tree)
+
 			return MethodClonefile, nil
 
 		case !isUnsupported(err):
@@ -174,21 +186,31 @@ func build(ctx context.Context, tpl, tree string, stats treeStats,
 		removeAll(tree)
 	}
 
-	w := &walker{opts: opts}
+	w := &walker{
+		opts: opts,
+		skip: map[string]struct{}{
+			".git/worktrees":             {},
+			".git/fsmonitor--daemon.ipc": {},
+		},
+	}
 	if err := w.copyDir(ctx, tpl, tree, ""); err != nil {
 		return "", err
 	}
 
-	if w.copied > 0 {
-		return MethodCopy, nil
-	}
-
-	return MethodReflink, nil
+	return w.method(), nil
 }
 
-// removeAll deletes dir, first making every directory in it writable so a
-// read-only directory in the template cannot strand the temporary tree.
-func removeAll(dir string) {
+// detachCopyGitDir removes host-specific runtime artifacts from a whole-tree
+// clone's .git directory so the copy does not list the template's linked
+// worktrees or inherit its fsmonitor socket.
+func detachCopyGitDir(tree string) {
+	removeAll(filepath.Join(tree, ".git", "worktrees"))
+	removeAll(filepath.Join(tree, ".git", "fsmonitor--daemon.ipc"))
+}
+
+// makeWritable makes every directory under dir owner-writable so a read-only
+// directory does not block removal.
+func makeWritable(dir string) {
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err == nil && d.IsDir() {
 			_ = os.Chmod(path, 0o700)
@@ -196,5 +218,11 @@ func removeAll(dir string) {
 
 		return nil
 	})
+}
+
+// removeAll deletes dir, first making every directory in it writable so a
+// read-only directory in the template cannot strand the temporary tree.
+func removeAll(dir string) {
+	makeWritable(dir)
 	_ = os.RemoveAll(dir)
 }

@@ -89,14 +89,10 @@ func checkTemplate(tpl string) error {
 		return err
 	}
 
-	// A host worktree record would be listed by the copy, and "git worktree
-	// repair" run there could rewrite the host's .git file.
-	records, err := os.ReadDir(filepath.Join(gitDir, "worktrees"))
-	switch {
-	case err == nil && len(records) > 0:
-		return refusef("%q has linked worktrees registered in .git/worktrees", tpl)
-
-	case err != nil && !errors.Is(err, fs.ErrNotExist):
+	commondir := filepath.Join(gitDir, "commondir")
+	if _, err := os.Lstat(commondir); err == nil {
+		return refusef("%q has a .git/commondir file", tpl)
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 
@@ -111,13 +107,19 @@ type treeStats struct {
 
 // scan walks the template without following symlinks, counts regular files
 // and refuses anything that is not a directory, regular file or symlink.
+// Host-only Git runtime entries (.git/worktrees and .git/fsmonitor--daemon.ipc)
+// are omitted from the copy and skipped here.
 func scan(root string) (treeStats, error) {
 	gitDir := filepath.Join(root, ".git") + string(filepath.Separator)
+	worktreesDir := filepath.Join(root, ".git", "worktrees")
+	fsmonitorSock := filepath.Join(root, ".git", "fsmonitor--daemon.ipc")
 
 	// A symlink inside .git, such as a hooks directory link, would let a
 	// write in the copy reach whatever it points at, so it is refused as
 	// special files are.
-	stats, _, err := scanTree(root, func(path string, m fs.FileMode) error {
+	stats, _, err := scanTreeSkip(root, func(path string) bool {
+		return path == worktreesDir || path == fsmonitorSock
+	}, func(path string, m fs.FileMode) error {
 		if m&fs.ModeSymlink != 0 && !strings.HasPrefix(path, gitDir) {
 			return nil
 		}
@@ -130,8 +132,16 @@ func scan(root string) (treeStats, error) {
 
 // scanTree counts the regular files under root. For every entry that is
 // neither a directory nor a regular file it calls onSpecial, which may be nil.
-// Symlinks are passed to onSpecial but are not counted as special. A non-nil error from onSpecial stops the walk.
+// Symlinks are passed to onSpecial but are not counted as special. A non-nil
+// error from onSpecial stops the walk.
 func scanTree(root string, onSpecial func(string, fs.FileMode) error) (treeStats, int, error) {
+	return scanTreeSkip(root, nil, onSpecial)
+}
+
+// scanTreeSkip is scanTree with an optional predicate that skips paths.
+func scanTreeSkip(root string, shouldSkip func(string) bool,
+	onSpecial func(string, fs.FileMode) error) (treeStats, int, error) {
+
 	var (
 		stats   treeStats
 		special int
@@ -140,6 +150,14 @@ func scanTree(root string, onSpecial func(string, fs.FileMode) error) (treeStats
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+
+		if shouldSkip != nil && shouldSkip(path) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+
+			return nil
 		}
 
 		switch {

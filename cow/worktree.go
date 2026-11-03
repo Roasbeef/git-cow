@@ -58,6 +58,27 @@ type AddOptions struct {
 	// registered worktree or a branch checked out elsewhere.
 	Force bool
 
+	// Quiet is "-q" or "--quiet".
+	Quiet bool
+
+	// Lock is "--lock", which keeps the new worktree locked after creation.
+	Lock bool
+
+	// LockReason is "--reason", the explanation recorded with "--lock".
+	LockReason string
+
+	// Track is "--track".
+	Track bool
+
+	// NoTrack is "--no-track".
+	NoTrack bool
+
+	// GuessRemote is "--guess-remote".
+	GuessRemote bool
+
+	// NoGuessRemote is "--no-guess-remote".
+	NoGuessRemote bool
+
 	// RequireCOW makes AddWorktree fail with ErrNoCoW instead of falling
 	// back to plain "git worktree add".
 	RequireCOW bool
@@ -134,7 +155,7 @@ func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
 		return AddResult{}, refusef("the source checkout has no commits")
 	}
 
-	supported, err := probeCoW(ctx, src, dest, opts.forceNoCoW)
+	supported, err := probeCoW(src, dest, opts.forceNoCoW)
 	if err != nil {
 		return AddResult{}, err
 	}
@@ -147,13 +168,15 @@ func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
 		return addPlain(ctx, src, dest, opts, start)
 	}
 
+	existedBefore := branchExistedBeforeAdd(ctx, src, dest, opts)
+
 	if err := runGit(ctx, src, addArgs(opts, dest, true)...); err != nil {
 		return AddResult{}, err
 	}
 
 	res, err := populateWorktree(ctx, src, srcHead, dest, opts)
 	if err != nil {
-		rollbackAdd(src, dest, opts)
+		rollbackAdd(src, dest, existedBefore)
 
 		return AddResult{}, err
 	}
@@ -177,7 +200,7 @@ func populateWorktree(ctx context.Context, src, srcHead, dest string,
 		opts:        Options{RequireCOW: opts.RequireCOW, forceNoCoW: opts.forceNoCoW},
 		skip:        map[string]struct{}{".git": {}},
 		skipSpecial: true,
-		treeClone:   !opts.forceWalk && !opts.forceNoCoW,
+		treeClone:   hasWholeTreeClone && !opts.forceWalk && !opts.forceNoCoW,
 	}
 
 	for _, p := range gitlinks {
@@ -188,32 +211,35 @@ func populateWorktree(ctx context.Context, src, srcHead, dest string,
 		return AddResult{}, err
 	}
 
-	// The source index describes exactly these files, so copying it gives
-	// the new worktree an index to compare against. The clones share the
-	// source's mtime and size but not its inode or ctime, so the refresh and
-	// the reset below compare only the first two. The index still holds the
-	// source's inode numbers after them. The final "git status" runs with
-	// Git's default settings, rehashes the files and stores the clones' own
-	// stat values, so later commands are fast.
-	if err := copyIndex(ctx, src, dest); err != nil {
+	// Copy the source index (and any split-index base) into the new
+	// worktree and update its stat cache with the clones' own inode and
+	// ctime values so Git does not rehash the working tree.
+	indexPath, err := copyIndex(ctx, src, dest)
+	if err != nil {
 		return AddResult{}, err
 	}
 
-	_ = runGit(ctx, dest, "-c", "core.checkStat=minimal", "-c", "core.trustctime=false",
-		"update-index", "--refresh", "-q")
+	refreshIndexStats(dest, indexPath, "")
 
-	// With the index at the source's HEAD, a hard reset to the worktree's
-	// own HEAD rewrites exactly the files that differ between the two
-	// commits, and removes the ones the target commit does not have. The
-	// reset must use the same relaxed stat comparison as the refresh. With
-	// Git's default it would see a different inode on every clone and
-	// rewrite the whole tree, which defeats the cloning.
-	if err := runGit(ctx, dest, "-c", "core.checkStat=minimal", "-c", "core.trustctime=false",
-		"reset", "--hard", "-q"); err != nil {
+	head, err := gitOut(ctx, dest, "rev-parse", "--verify", "HEAD")
+	if err != nil {
 		return AddResult{}, err
 	}
 
-	status, err := gitOut(ctx, dest, "status", "--porcelain=v1", "--untracked-files=no")
+	// When the target commit differs from the source HEAD or the repository
+	// has submodules, a hard reset rewrites only the files that differ
+	// between the two commits and creates the empty submodule directories.
+	if head != srcHead || len(gitlinks) > 0 {
+		_ = runGit(ctx, dest, "-c", "core.checkStat=minimal", "-c", "core.trustctime=false",
+			"update-index", "--refresh", "-q")
+
+		if err := runGit(ctx, dest, "-c", "core.checkStat=minimal", "-c", "core.trustctime=false",
+			"reset", "--hard", "-q"); err != nil {
+			return AddResult{}, err
+		}
+	}
+
+	status, err := gitOut(ctx, dest, "status", "--porcelain=v1", "--untracked-files=no", "--ignore-submodules=dirty")
 	if err != nil {
 		return AddResult{}, err
 	}
@@ -222,21 +248,7 @@ func populateWorktree(ctx context.Context, src, srcHead, dest string,
 		return AddResult{}, fmt.Errorf("new worktree does not match its commit:\n%s", status)
 	}
 
-	head, err := gitOut(ctx, dest, "rev-parse", "--verify", "HEAD")
-	if err != nil {
-		return AddResult{}, err
-	}
-
-	method := MethodReflink
-	switch {
-	case w.copied > 0:
-		method = MethodCopy
-
-	case w.wholeTrees > 0:
-		method = MethodClonefile
-	}
-
-	return AddResult{Method: method, Path: dest, Files: w.files, Bytes: w.bytes, Head: head}, nil
+	return AddResult{Method: w.method(), Path: dest, Files: w.files, Bytes: w.bytes, Head: head}, nil
 }
 
 // addPlain makes the worktree with plain Git, for filesystems that cannot
@@ -264,12 +276,40 @@ func addArgs(opts AddOptions, dest string, noCheckout bool) []string {
 		args = append(args, "--no-checkout")
 	}
 
+	if opts.Quiet {
+		args = append(args, "--quiet")
+	}
+
 	if opts.Detach {
 		args = append(args, "--detach")
 	}
 
 	if opts.Force {
 		args = append(args, "--force")
+	}
+
+	if opts.Lock {
+		args = append(args, "--lock")
+	}
+
+	if opts.LockReason != "" {
+		args = append(args, "--reason", opts.LockReason)
+	}
+
+	if opts.Track {
+		args = append(args, "--track")
+	}
+
+	if opts.NoTrack {
+		args = append(args, "--no-track")
+	}
+
+	if opts.GuessRemote {
+		args = append(args, "--guess-remote")
+	}
+
+	if opts.NoGuessRemote {
+		args = append(args, "--no-guess-remote")
 	}
 
 	if opts.Branch != "" {
@@ -280,7 +320,7 @@ func addArgs(opts AddOptions, dest string, noCheckout bool) []string {
 		args = append(args, "-B", opts.ResetBranch)
 	}
 
-	args = append(args, dest)
+	args = append(args, "--", dest)
 
 	if opts.Commitish != "" {
 		args = append(args, opts.Commitish)
@@ -289,24 +329,56 @@ func addArgs(opts AddOptions, dest string, noCheckout bool) []string {
 	return args
 }
 
-// rollbackAdd undoes a half-made worktree and the branch created for it.
+// branchExistedBeforeAdd reports whether the branch that "git worktree add"
+// would check out in dest already existed in src before the add.
+func branchExistedBeforeAdd(ctx context.Context, src, dest string, opts AddOptions) bool {
+	if opts.Detach || opts.Branch != "" {
+		return false
+	}
+
+	var candidate string
+	switch {
+	case opts.ResetBranch != "":
+		candidate = "refs/heads/" + opts.ResetBranch
+	case opts.Commitish != "":
+		candidate = opts.Commitish
+	default:
+		candidate = "refs/heads/" + filepath.Base(dest)
+	}
+
+	out, err := gitOut(ctx, src, "rev-parse", "--verify", "--quiet", "--symbolic-full-name", candidate)
+
+	return err == nil && strings.HasPrefix(out, "refs/heads/")
+}
+
+// rollbackAdd undoes a half-made worktree and any branch created for it.
 //
 // It never runs "git worktree prune", which would also delete the records of
 // unrelated worktrees whose directories happen to be missing. If Git cannot
 // remove the worktree, only this worktree's own record is deleted.
-func rollbackAdd(src, dest string, opts AddOptions) {
+func rollbackAdd(src, dest string, branchExistedBefore bool) {
 	ctx := context.Background()
 
-	if err := runGit(ctx, src, "worktree", "remove", "--force", dest); err != nil {
-		if record := worktreeRecord(dest); record != "" {
-			_ = os.RemoveAll(record)
+	record := worktreeRecord(dest)
+	var createdBranch string
+	if !branchExistedBefore && record != "" {
+		if data, err := os.ReadFile(filepath.Join(record, "HEAD")); err == nil {
+			if b, ok := strings.CutPrefix(strings.TrimSpace(string(data)), "ref: refs/heads/"); ok {
+				createdBranch = b
+			}
 		}
 	}
 
-	_ = os.RemoveAll(dest)
+	makeWritable(dest)
 
-	if opts.Branch != "" {
-		_ = runGit(ctx, src, "branch", "-D", opts.Branch)
+	if err := runGit(ctx, src, "worktree", "remove", "--force", "--force", dest); err != nil && record != "" {
+		_ = os.RemoveAll(record)
+	}
+
+	removeAll(dest)
+
+	if createdBranch != "" {
+		_ = runGit(ctx, src, "branch", "-D", createdBranch)
 	}
 }
 
@@ -322,12 +394,16 @@ func worktreeRecord(dest string) string {
 		return ""
 	}
 
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(dest, dir)
+	}
+
 	return dir
 }
 
 // requireClean refuses a source whose tracked files differ from HEAD.
 func requireClean(ctx context.Context, src string) error {
-	status, err := gitOut(ctx, src, "status", "--porcelain=v1", "--untracked-files=no")
+	status, err := gitOut(ctx, src, "status", "--porcelain=v1", "--untracked-files=no", "--ignore-submodules=dirty")
 	if err != nil {
 		return err
 	}
@@ -359,16 +435,52 @@ func gitlinkPaths(ctx context.Context, src string) ([]string, error) {
 	return paths, nil
 }
 
-// copyIndex copies src's index file over dest's.
-func copyIndex(ctx context.Context, src, dest string) error {
+// copyIndex copies src's index file (and any split-index base file) into
+// dest's Git directory, and returns the path of dest's index.
+func copyIndex(ctx context.Context, src, dest string) (string, error) {
 	from, err := gitOut(ctx, src, "rev-parse", "--path-format=absolute", "--git-path", "index")
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	to, err := gitOut(ctx, dest, "rev-parse", "--path-format=absolute", "--git-path", "index")
 	if err != nil {
-		return err
+		return "", err
+	}
+
+	if err := copyOrCloneFile(from, to); err != nil {
+		return "", err
+	}
+
+	fromDir, toDir := filepath.Dir(from), filepath.Dir(to)
+	if fromDir != toDir {
+		entries, err := os.ReadDir(fromDir)
+		if err != nil {
+			return "", err
+		}
+
+		for _, e := range entries {
+			if e.Type().IsRegular() && strings.HasPrefix(e.Name(), "sharedindex.") {
+				if err := copyOrCloneFile(filepath.Join(fromDir, e.Name()), filepath.Join(toDir, e.Name())); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
+
+	return to, nil
+}
+
+// copyOrCloneFile duplicates a file inside the Git directory, cloning when
+// possible and copying bytes otherwise.
+func copyOrCloneFile(from, to string) error {
+	_ = os.Remove(to)
+	if err := cloneFile(from, to); err == nil {
+		if !clonePreservesMeta {
+			return os.Chmod(to, 0o644)
+		}
+
+		return nil
 	}
 
 	data, err := os.ReadFile(from)
@@ -379,16 +491,21 @@ func copyIndex(ctx context.Context, src, dest string) error {
 	return os.WriteFile(to, data, 0o644)
 }
 
-// probeCoW reports whether files from src's Git directory can be cloned to
-// the place dest will go, by cloning one small file there and removing it.
-func probeCoW(ctx context.Context, src, dest string, forceNo bool) (bool, error) {
+// probeCoW reports whether files from src can be cloned to the place dest
+// will go, by cloning one small file there and removing it.
+func probeCoW(src, dest string, forceNo bool) (bool, error) {
 	if forceNo {
 		return false, nil
 	}
 
-	common, err := gitOut(ctx, src, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	target := filepath.Join(src, ".git")
+	info, err := os.Lstat(target)
 	if err != nil {
 		return false, err
+	}
+
+	if info.IsDir() {
+		target = filepath.Join(target, "HEAD")
 	}
 
 	dir := filepath.Dir(dest)
@@ -402,7 +519,7 @@ func probeCoW(ctx context.Context, src, dest string, forceNo bool) (bool, error)
 
 	probe := filepath.Join(dir, fmt.Sprintf(".git-cow-probe-%d", time.Now().UnixNano()))
 
-	err = cloneFile(filepath.Join(common, "HEAD"), probe)
+	err = cloneFile(target, probe)
 	_ = os.Remove(probe)
 
 	switch {

@@ -9,6 +9,13 @@ import (
 	"time"
 )
 
+// Platform capabilities for whole-tree and per-file cloning.
+const (
+	hasWholeTreeClone  = false
+	clonePreservesMeta = false
+	methodFileClone    = MethodCopy
+)
+
 // errNoCoW marks a clone attempt that the platform cannot perform.
 var errNoCoW = errors.New("no clone support on this platform")
 
@@ -33,3 +40,6 @@ func renameNoReplace(oldPath, newPath string) error {
 
 // lchtimes does nothing: symlink times are not preserved on this platform.
 func lchtimes(path string, t time.Time) error { return nil }
+
+// statIndexFields is a no-op where unix stat fields are not read directly.
+func statIndexFields(path string) (indexStat, bool) { return indexStat{}, false }
