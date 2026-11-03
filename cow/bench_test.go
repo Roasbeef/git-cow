@@ -95,3 +95,45 @@ func BenchmarkCopy(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkAddWorktree times AddWorktree on a generated repository.
+func BenchmarkAddWorktree(b *testing.B) {
+	src := benchRepo(b)
+
+	for _, mode := range []struct {
+		name string
+		opts AddOptions
+	}{
+		{"native", AddOptions{}},
+		{"walk", AddOptions{forceWalk: true}},
+	} {
+		b.Run(mode.name, func(b *testing.B) {
+			parent := b.TempDir()
+
+			var last AddResult
+
+			for i := 0; i < b.N; i++ {
+				dest := filepath.Join(parent, fmt.Sprintf("wt%d", i))
+				opts := mode.opts
+				opts.Dir = src
+				opts.Path = dest
+				opts.Detach = true
+
+				res, err := AddWorktree(context.Background(), opts)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				last = res
+
+				b.StopTimer()
+				git(b, src, "worktree", "remove", "--force", dest)
+				b.StartTimer()
+			}
+
+			b.ReportMetric(float64(last.Files), "files/op")
+			b.ReportMetric(float64(last.Bytes)/(1<<20), "MiB/op")
+			b.Logf("method=%s", last.Method)
+		})
+	}
+}

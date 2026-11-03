@@ -439,8 +439,13 @@ func TestAddScansOnceWhenTreeCloneUnsupported(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if calls != 1 {
-		t.Errorf("whole-tree clone attempted %d times, want 1", calls)
+	want := 0
+	if hasWholeTreeClone {
+		want = 1
+	}
+
+	if calls != want {
+		t.Errorf("whole-tree clone attempted %d times, want %d", calls, want)
 	}
 }
 
@@ -529,5 +534,107 @@ func TestAddRollbackLeavesOtherWorktrees(t *testing.T) {
 
 	if out := git(t, src, "worktree", "list", "--porcelain"); !strings.Contains(out, "stale") {
 		t.Errorf("the unrelated worktree record was pruned:\n%s", out)
+	}
+}
+
+// TestAddSplitIndex checks AddWorktree works when core.splitIndex is enabled
+// and the source index references a sharedindex.<sha> base file.
+func TestAddSplitIndex(t *testing.T) {
+	requireClone(t)
+
+	src := newRepo(t)
+	git(t, src, "config", "core.splitIndex", "true")
+	git(t, src, "update-index", "--split-index")
+
+	write(t, filepath.Join(src, "split.txt"), "split\n")
+	git(t, src, "add", "split.txt")
+	git(t, src, "commit", "-q", "-m", "with split index")
+
+	res, err := addTo(t, src, "wt", AddOptions{Branch: "feat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := git(t, res.Path, "status", "--porcelain"); got != "" {
+		t.Errorf("status = %q, want clean", got)
+	}
+
+	if got := read(t, filepath.Join(res.Path, "split.txt")); got != "split\n" {
+		t.Errorf("split.txt = %q", got)
+	}
+}
+
+// TestAddDirtySubmoduleAllowed checks that modified or untracked files inside
+// a submodule worktree in the source do not cause AddWorktree to refuse.
+func TestAddDirtySubmoduleAllowed(t *testing.T) {
+	src := newRepo(t)
+	sub := newRepo(t)
+
+	git(t, src, "submodule", "add", "-q", sub, "sm")
+	git(t, src, "commit", "-q", "-m", "add submodule")
+
+	write(t, filepath.Join(src, "sm", "README.md"), "dirty inside submodule\n")
+	write(t, filepath.Join(src, "sm", "untracked.o"), "artifact\n")
+
+	res, err := addTo(t, src, "wt", AddOptions{Branch: "feat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if entries := names(t, filepath.Join(res.Path, "sm")); len(entries) != 0 {
+		t.Errorf("submodule directory holds %v, want empty", entries)
+	}
+}
+
+// TestAddRollbackCleansReadOnlyAndImplicitBranch checks that a failed add
+// removes read-only directories in the half-made worktree as well as the
+// branch Git created from the destination basename when -b was not given.
+func TestAddRollbackCleansReadOnlyAndImplicitBranch(t *testing.T) {
+	requireClone(t)
+
+	src := newRepo(t)
+	ro := filepath.Join(src, "ro_cache", "pkg")
+	write(t, filepath.Join(ro, "mod.go"), "package pkg\n")
+
+	if err := os.Chmod(ro, 0o500); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		_ = os.Chmod(ro, 0o700)
+		perFileHook = nil
+	})
+
+	n := 0
+	perFileHook = func(string) error {
+		if n++; n == 4 {
+			return errors.New("injected failure")
+		}
+
+		return nil
+	}
+
+	// Omit Branch so Git creates a branch named "implicit-wt" from the path.
+	if _, err := addTo(t, src, "implicit-wt", AddOptions{forceWalk: true}); err == nil {
+		t.Fatal("expected a failure")
+	}
+
+	if _, err := os.Lstat(filepath.Join(filepath.Dir(src), "implicit-wt")); err == nil {
+		t.Error("destination directory remains after rollback")
+	}
+
+	if _, err := gitErr(src, "rev-parse", "--verify", "implicit-wt"); err == nil {
+		t.Error("implicit branch remains after rollback")
+	}
+
+	// A pre-existing branch checked out by basename DWIM must NOT be deleted on rollback.
+	git(t, src, "branch", "existing-wt")
+	n = 0
+	if _, err := addTo(t, src, "existing-wt", AddOptions{forceWalk: true, Lock: true}); err == nil {
+		t.Fatal("expected a failure")
+	}
+
+	if _, err := gitErr(src, "rev-parse", "--verify", "existing-wt"); err != nil {
+		t.Errorf("pre-existing branch was deleted on rollback: %v", err)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -490,12 +491,27 @@ func TestRefusals(t *testing.T) {
 		refused(t, err)
 	})
 
-	t.Run("template has linked worktrees", func(t *testing.T) {
-		tpl := newRepo(t)
-		git(t, tpl, "worktree", "add", "-q", "-b", "hostwt", filepath.Join(filepath.Dir(tpl), "hostwt"))
+	t.Run("template has linked worktrees is detached", func(t *testing.T) {
+		for _, mode := range copyModes {
+			t.Run(mode.name, func(t *testing.T) {
+				tpl := newRepo(t)
+				hostWT := filepath.Join(filepath.Dir(tpl), "hostwt")
+				git(t, tpl, "worktree", "add", "-q", "-b", "hostwt", hostWT)
 
-		_, err := Copy(context.Background(), tpl, filepath.Join(filepath.Dir(tpl), "out"), Options{})
-		refused(t, err)
+				out := filepath.Join(filepath.Dir(tpl), "out")
+				if _, err := Copy(context.Background(), tpl, out, mode.opts); err != nil {
+					t.Fatal(err)
+				}
+
+				if _, err := os.Lstat(filepath.Join(out, ".git", "worktrees")); !errors.Is(err, fs.ErrNotExist) {
+					t.Errorf(".git/worktrees exists in copy: %v", err)
+				}
+
+				if list := git(t, out, "worktree", "list", "--porcelain"); strings.Count(list, "worktree ") != 1 || strings.Contains(list, "hostwt") {
+					t.Errorf("copy lists host worktree:\n%s", list)
+				}
+			})
+		}
 	})
 
 	t.Run("symlink under .git", func(t *testing.T) {
@@ -606,6 +622,14 @@ func TestCopyRefusesForeignWorktree(t *testing.T) {
 		"core.worktree": func(t *testing.T, tpl string) {
 			git(t, tpl, "config", "core.worktree", t.TempDir())
 		},
+		"core.worktree self": func(t *testing.T, tpl string) {
+			resolved, err := filepath.EvalSymlinks(tpl)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			git(t, tpl, "config", "core.worktree", resolved)
+		},
 		"commondir": func(t *testing.T, tpl string) {
 			other := newRepo(t)
 			write(t, filepath.Join(tpl, ".git", "commondir"), filepath.Join(other, ".git")+"\n")
@@ -620,8 +644,11 @@ func TestCopyRefusesForeignWorktree(t *testing.T) {
 			parent := filepath.Dir(tpl)
 			dest := filepath.Join(parent, "copy")
 
-			if _, err := Copy(context.Background(), tpl, dest, Options{}); err == nil {
-				t.Fatal("the copy was made")
+			_, err := Copy(context.Background(), tpl, dest, Options{})
+
+			var r *RefusalError
+			if !errors.As(err, &r) {
+				t.Fatalf("err = %v, want a RefusalError", err)
 			}
 
 			assertNothingLeft(t, parent, dest, "tpl")

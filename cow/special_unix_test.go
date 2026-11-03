@@ -90,3 +90,74 @@ func TestAddIndexHoldsCloneInodes(t *testing.T) {
 		t.Errorf("index stat data lacks %q:\n%s", want, out)
 	}
 }
+
+// TestCopyIndexHoldsCloneInodes checks that Copy refreshes settled index
+// entries with the copy's own inode numbers while leaving dirty files dirty,
+// including a file whose mtime and size match the index but whose inode/ctime
+// changed.
+func TestCopyIndexHoldsCloneInodes(t *testing.T) {
+	requireClone(t)
+
+	for _, ver := range []string{"2", "4"} {
+		t.Run("v"+ver, func(t *testing.T) {
+			tpl := newRepo(t)
+			git(t, tpl, "config", "index.version", ver)
+			ageFiles(t, tpl)
+			git(t, tpl, "update-index", "--force-write-index")
+
+			// Dirty src/a.txt with the same size and forged mtime so only
+			// ctime/ino in the template reveal the edit.
+			aPath := filepath.Join(tpl, "src", "a.txt")
+			aInfo, err := os.Stat(aPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			write(t, aPath, "bravo\n")
+			if err := os.Chtimes(aPath, aInfo.ModTime(), aInfo.ModTime()); err != nil {
+				t.Fatal(err)
+			}
+
+			dest := filepath.Join(filepath.Dir(tpl), "copy")
+			if _, err := Copy(context.Background(), tpl, dest, Options{}); err != nil {
+				t.Fatal(err)
+			}
+
+			var st unix.Stat_t
+			if err := unix.Stat(filepath.Join(dest, "README.md"), &st); err != nil {
+				t.Fatal(err)
+			}
+
+			out := git(t, dest, "ls-files", "--debug", "README.md")
+			if want := fmt.Sprintf("ino: %d", st.Ino); !strings.Contains(out, want) {
+				t.Errorf("copy index stat data lacks %q:\n%s", want, out)
+			}
+
+			if status := git(t, dest, "status", "--porcelain"); status != "M src/a.txt" {
+				t.Errorf("status = %q, want dirty src/a.txt preserved", status)
+			}
+		})
+	}
+}
+
+// TestCopySkipsFsMonitorSocket checks that a template with a socket at
+// .git/fsmonitor--daemon.ipc can be copied and the socket is omitted.
+func TestCopySkipsFsMonitorSocket(t *testing.T) {
+	for _, mode := range copyModes {
+		t.Run(mode.name, func(t *testing.T) {
+			tpl := newRepo(t)
+			if err := unix.Mkfifo(filepath.Join(tpl, ".git", "fsmonitor--daemon.ipc"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			dest := filepath.Join(filepath.Dir(tpl), "copy")
+			if _, err := Copy(context.Background(), tpl, dest, mode.opts); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := os.Lstat(filepath.Join(dest, ".git", "fsmonitor--daemon.ipc")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("fsmonitor--daemon.ipc exists in copy: %v", err)
+			}
+		})
+	}
+}

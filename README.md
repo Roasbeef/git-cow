@@ -58,11 +58,17 @@ git cow remove ../app-feature-x
 
 ```
 git-cow [-C <dir>] copy [--require-cow] [--json] <template> <dest>
-git-cow [-C <dir>] add [-b <branch>] [-B <branch>] [--detach] [--force]
+git-cow [-C <dir>] add [-b <branch>] [-B <branch>] [-d|--detach] [-f|--force]
+                       [-q|--quiet] [--lock [--reason <string>]]
+                       [--track|--no-track] [--guess-remote|--no-guess-remote]
                        [--require-cow] [--json] <path> [<commit-ish>]
 git-cow [-C <dir>] list [--porcelain]
 git-cow [-C <dir>] remove [--force] <path>
 git-cow [-C <dir>] prune
+git-cow [-C <dir>] move <worktree> <new-path>
+git-cow [-C <dir>] lock [--reason <string>] <worktree>
+git-cow [-C <dir>] unlock <worktree>
+git-cow [-C <dir>] repair [<path>...]
 ```
 
 `-C <dir>` runs the command as if started in `<dir>`, as Git's `-C` does.
@@ -74,17 +80,13 @@ directory. These are refused, with exit status 2:
 
 - a linked worktree (`.git` is a file) or a symlinked `.git`;
 - a repository with `.git/objects/info/alternates`;
-- a repository with any linked worktree registered in `.git/worktrees`, since
-  the copy would list the host's worktree;
 - a symlink anywhere under `.git`, since a write through it could reach the
   host;
-- a `core.worktree` setting or a `.git/commondir` file that makes Git in the
-  copy act on another path. This is found by the check after copying, so
-  the copy is built and then removed;
+- a `core.worktree` setting or a `.git/commondir` file that makes Git act on
+  another path;
 - a destination that exists, or that is inside the template or contains it;
-- a tree holding a device, socket or FIFO. This includes the socket that
-  Git's fsmonitor daemon leaves at `.git/fsmonitor--daemon.ipc`, so stop the
-  daemon in the template first.
+- a tree holding a device, socket or FIFO (except `.git/fsmonitor--daemon.ipc`,
+  which is omitted from the copy along with `.git/worktrees`).
 
 The tree is built in a hidden temporary directory next to `<dest>` and
 renamed into place as the last step with a rename that fails if `<dest>`
@@ -98,7 +100,7 @@ check with `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`,
 `--json` prints one line:
 
 ```
-{"method":"clonefile","files":3524,"bytes":143499022,"elapsed_ms":310,"head":"ae8d2539..."}
+{"method":"clonefile","path":"/srv/work/ticket-123","files":3524,"bytes":143499022,"elapsed_ms":310,"head":"ae8d2539..."}
 ```
 
 `method` is `clonefile`, `reflink` or `copy`. `head` is empty for a
@@ -110,9 +112,9 @@ repository with no commits. Without `--json` one short line is printed.
 metadata, then fills the directory with clones of the files of the checkout
 that contains the current directory (or `-C`). Git's rules therefore hold:
 a branch checked out elsewhere is refused, `--force` means what Git says,
-and `git worktree list`, `remove` and `prune` work on the result, and
-`git-cow list`, `remove` and `prune` work on worktrees that plain Git made.
-Those three commands run `git worktree` directly.
+and `git worktree list`, `remove`, `prune`, `move`, `lock`, `unlock` and
+`repair` work on the result, and the same `git-cow` subcommands work on
+worktrees that plain Git made. Those subcommands run `git worktree` directly.
 
 The source checkout is not allowed to be dirty, which here means any staged
 or unstaged change to a tracked file. Untracked and ignored files are fine,
@@ -133,9 +135,8 @@ Further behavior:
 - If the filesystem cannot clone, `add` runs plain `git worktree add`, or
   exits 3 with `--require-cow`.
 - If anything fails after Git created the worktree, the worktree and any
-  branch made by `-b` are removed. A branch Git named after the path's
-  basename, when neither `-b` nor `-B` is given, is left behind, and an empty
-  directory given as `<path>` is removed. `add` never runs `git worktree prune`.
+  branch created for it (whether by `-b`, `-B` or named after the path's
+  basename) are removed. `add` never runs `git worktree prune`.
 - A commit-ish that tracks a path where the source has an untracked file
   replaces that file.
 
@@ -149,7 +150,7 @@ Further behavior:
 | 3 | `--require-cow` was given and the filesystem cannot clone. |
 
 `add` returns Git's own status when Git fails (usually 128). `list`,
-`remove` and `prune` return Git's status.
+`remove`, `prune`, `move`, `lock`, `unlock` and `repair` return Git's status.
 
 ## How cloning works
 
@@ -214,7 +215,7 @@ In this section `add.go` is `internal/worktree/add.go`, and `apfs_darwin.go` and
 | | git-worktree-apfs | git-cow |
 | --- | --- | --- |
 | Command line | `add <path> --new-branch X` and `--branch X`, own flags | Git's: `add -b X`, `-B`, `--detach`, `--force`, `<path> [<commit-ish>]` |
-| `list`, `remove`, `prune` | None | Same as `git worktree` |
+| `list`, `remove`, `prune`, `move`, `lock`, `unlock`, `repair` | None | Same as `git worktree` |
 | Independent copy (own `.git`) | No | `copy` |
 | macOS | APFS only, found by running `df` and `diskutil` | Tries the clone and falls back |
 | Linux | Builds, then reports unsupported (`unsupported.go:18`) | FICLONE per file, unmeasured |
@@ -257,12 +258,10 @@ Notes on these numbers:
 
 - `git worktree add` copies the tracked files only. The other rows also carry
   the ignored 64 MiB file.
-- `git-cow add` is the slowest worktree row. Its last step runs a full
-  `git status` that hashes every tracked file and writes fresh stat data
-  into the index. That is why its first later `git status` takes 0.03 s
-  while the others pay 0.5 s on first use. The time is moved, not removed.
-- `git-cow copy` leaves the index with the template's inode numbers, so its
-  first `git status` rehashes the files, as `git worktree-apfs` leaves it too.
+- The table above was recorded before `git-cow` updated index stat data
+  directly from `lstat` on the clones. Both `add` and `copy` now write the
+  clones' inode and `ctime` values into `.git/index` without hashing every
+  tracked file.
 - Linux: unmeasured. The reflink path is built and vetted for Linux and its
   fallback is covered by tests, but it has not been timed or run on a
   filesystem with reflinks.
