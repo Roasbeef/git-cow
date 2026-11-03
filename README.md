@@ -228,46 +228,6 @@ In this section `add.go` is `internal/worktree/add.go`, and `apfs_darwin.go` and
 | Cloning of `.git` | Clones the source `.git`, then deletes it (`apfs_darwin.go:36-54`) | Never touches it |
 | Sockets and FIFOs | Not handled | Skipped by `add`, refused by `copy` |
 
-### Things found in its code
-
-Each of these was reproduced unless marked as read only.
-
-- `add.go:154` creates a temporary worktree and a new branch before the
-  head check at `add.go:62`. When the check refuses, `add.go:59` deletes
-  only the temporary directory. The branch and a `prunable` worktree record
-  remain in the source repository.
-- `add.go:193` runs `reset --mixed`, so with `--allow-dirty` staged changes
-  become unstaged in the new worktree.
-- `add.go:100` passes `--untracked-files=all`, so a checkout with an
-  unignored build directory is refused although the README promises build
-  output is carried over.
-- A submodule directory is cloned with its `.git` file, which says
-  `gitdir: ../.git/modules/sm`. Relative to the new worktree that path does
-  not exist, and `git status` inside the submodule fails.
-- Worktree metadata directories are named `worktree`, `worktree1`, and so on,
-  because the temporary directory is named `worktree`.
-- Read only: `add.go:46` checks the destination does not exist and
-  `add.go:68` calls `os.RemoveAll(destination)` if the clone fails. If
-  another process created the destination in between, the clone fails with
-  `EEXIST` and the other process's directory is deleted.
-- Read only: `apfs_darwin.go:29` compares the filesystem name with `"APFS"`,
-  but `diskutil` reports `APFS (Case-sensitive)` for case-sensitive volumes,
-  which would then be refused.
-- Read only: the destination is visible and incomplete between the clone at
-  `add.go:67` and the end of `add.go:75`, so it is not atomic.
-
-### What we took from it
-
-- Create the metadata with `git worktree add --no-checkout` and fill the
-  directory afterwards, so Git's records are right and Git's own refusals
-  apply. We do this in place, so there is no repair step and the metadata
-  has the right name.
-- A check that the filesystem can clone before doing any work. We probe by
-  cloning one small file from the Git directory to the destination's parent.
-- `--no-refresh` showed that the index is the expensive part of the first
-  `git status`. We copy and refresh the index instead, which makes that
-  status cheap.
-
 ### Measured
 
 Template: a `git clone --no-hardlinks` of the Loom repository. It has 3,523
