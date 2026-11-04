@@ -299,7 +299,9 @@ with the other.
 
 The packages are `cow` (the library, with `Copy` and `AddWorktree`) and
 `cmd/git-cow`. Platform code is in `cow/platform_darwin.go`,
-`cow/platform_linux.go` and `cow/platform_other.go`.
+`cow/platform_linux.go` and `cow/platform_other.go`. See
+[`docs/architecture.md`](docs/architecture.md) for the component map, pipeline
+flowcharts, state machines, and index stat-refresh design.
 
 ## License
 
