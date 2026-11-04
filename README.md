@@ -31,6 +31,12 @@ we learned from it.
 ## Install
 
 ```
+make install
+```
+
+Or with `go install`:
+
+```
 go install github.com/roasbeef/git-cow/cmd/git-cow@latest
 ```
 
