@@ -142,8 +142,8 @@ func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
 
 	dest = resolveLoose(filepath.Clean(dest))
 
-	if within(src, dest) {
-		return AddResult{}, refusef("destination %q is inside the source checkout", opts.Path)
+	if dest == src || within(filepath.Join(src, ".git"), dest) {
+		return AddResult{}, refusef("destination %q is inside the source checkout root or .git", opts.Path)
 	}
 
 	if err := requireClean(ctx, src); err != nil {
@@ -169,14 +169,15 @@ func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
 	}
 
 	existedBefore := branchExistedBeforeAdd(ctx, src, dest, opts)
+	createdParent := missingSubtreeRoot(src, dest)
 
 	if err := runGit(ctx, src, addArgs(opts, dest, true)...); err != nil {
 		return AddResult{}, err
 	}
 
-	res, err := populateWorktree(ctx, src, srcHead, dest, opts)
+	res, err := populateWorktree(ctx, src, srcHead, dest, createdParent, opts)
 	if err != nil {
-		rollbackAdd(src, dest, existedBefore)
+		rollbackAdd(src, dest, createdParent, existedBefore)
 
 		return AddResult{}, err
 	}
@@ -188,10 +189,15 @@ func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
 
 // populateWorktree fills the empty worktree dest from src and checks the
 // result against its HEAD.
-func populateWorktree(ctx context.Context, src, srcHead, dest string,
+func populateWorktree(ctx context.Context, src, srcHead, dest, createdParent string,
 	opts AddOptions) (AddResult, error) {
 
 	gitlinks, err := gitlinkPaths(ctx, src)
+	if err != nil {
+		return AddResult{}, err
+	}
+
+	nestedWTs, err := worktreesInside(ctx, src)
 	if err != nil {
 		return AddResult{}, err
 	}
@@ -205,6 +211,18 @@ func populateWorktree(ctx context.Context, src, srcHead, dest string,
 
 	for _, p := range gitlinks {
 		w.skip[p] = struct{}{}
+	}
+
+	for _, p := range nestedWTs {
+		w.skip[p] = struct{}{}
+	}
+
+	if createdParent != "" {
+		w.skip[createdParent] = struct{}{}
+	} else if within(src, dest) {
+		if rel, relErr := filepath.Rel(src, dest); relErr == nil {
+			w.skip[filepath.ToSlash(rel)] = struct{}{}
+		}
 	}
 
 	if err := w.populate(ctx, src, dest, ""); err != nil {
@@ -356,7 +374,7 @@ func branchExistedBeforeAdd(ctx context.Context, src, dest string, opts AddOptio
 // It never runs "git worktree prune", which would also delete the records of
 // unrelated worktrees whose directories happen to be missing. If Git cannot
 // remove the worktree, only this worktree's own record is deleted.
-func rollbackAdd(src, dest string, branchExistedBefore bool) {
+func rollbackAdd(src, dest, createdParent string, branchExistedBefore bool) {
 	ctx := context.Background()
 
 	record := worktreeRecord(dest)
@@ -376,10 +394,66 @@ func rollbackAdd(src, dest string, branchExistedBefore bool) {
 	}
 
 	removeAll(dest)
+	if createdParent != "" {
+		removeAll(filepath.Join(src, filepath.FromSlash(createdParent)))
+	}
 
 	if createdBranch != "" {
 		_ = runGit(ctx, src, "branch", "-D", createdBranch)
 	}
+}
+
+// missingSubtreeRoot returns the highest slash-separated relative path beneath
+// src on the way to dest that does not yet exist before "git worktree add"
+// creates it, or "" when dest is outside src.
+func missingSubtreeRoot(src, dest string) string {
+	if !within(src, dest) || dest == src {
+		return ""
+	}
+
+	rel, err := filepath.Rel(src, dest)
+	if err != nil {
+		return ""
+	}
+
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	cur := src
+	for i, part := range parts {
+		cur = filepath.Join(cur, part)
+		if _, err := os.Lstat(cur); errors.Is(err, os.ErrNotExist) {
+			return strings.Join(parts[:i+1], "/")
+		}
+	}
+
+	return filepath.ToSlash(rel)
+}
+
+// worktreesInside returns the slash-separated paths, relative to src, of any
+// linked worktrees currently located beneath src.
+func worktreesInside(ctx context.Context, src string) ([]string, error) {
+	out, err := gitOut(ctx, src, "worktree", "list", "--porcelain", "-z")
+	if err != nil {
+		return nil, err
+	}
+
+	var rels []string
+	for _, tok := range strings.Split(out, "\x00") {
+		p, ok := strings.CutPrefix(tok, "worktree ")
+		if !ok {
+			continue
+		}
+
+		p = resolveLoose(filepath.Clean(p))
+		if p == src || !within(src, p) {
+			continue
+		}
+
+		if rel, relErr := filepath.Rel(src, p); relErr == nil {
+			rels = append(rels, filepath.ToSlash(rel))
+		}
+	}
+
+	return rels, nil
 }
 
 // worktreeRecord returns the administrative directory named by dest/.git.

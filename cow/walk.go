@@ -80,6 +80,12 @@ func (w *walker) copyDir(ctx context.Context, src, dst, rel string) error {
 		return err
 	}
 
+	if rel != "" && w.containsSkip(rel) {
+		if entries, err := os.ReadDir(dst); err == nil && len(entries) == 0 {
+			return os.Remove(dst)
+		}
+	}
+
 	return finish(dst, info)
 }
 

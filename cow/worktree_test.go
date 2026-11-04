@@ -381,15 +381,43 @@ func TestAddFailureRollsBack(t *testing.T) {
 	}
 }
 
-// TestAddRefusesDestinationInsideSource checks the walk cannot copy into itself.
-func TestAddRefusesDestinationInsideSource(t *testing.T) {
+// TestAddInsideSourceCheckout checks that creating worktrees inside the source
+// checkout (such as .worktrees/<name>) skips the destination and sibling
+// worktrees instead of recursing into itself, while still refusing the source
+// root or .git.
+func TestAddInsideSourceCheckout(t *testing.T) {
+	requireClone(t)
+
 	src := newRepo(t)
 
-	_, err := AddWorktree(context.Background(), AddOptions{Dir: src, Path: "inside"})
+	for _, bad := range []string{".", ".git/wt"} {
+		_, err := AddWorktree(context.Background(), AddOptions{Dir: src, Path: bad, Branch: "bad"})
+		var r *RefusalError
+		if !errors.As(err, &r) {
+			t.Fatalf("Path=%q: err = %v, want a RefusalError", bad, err)
+		}
+	}
 
-	var r *RefusalError
-	if !errors.As(err, &r) {
-		t.Fatalf("err = %v, want a RefusalError", err)
+	res1, err := AddWorktree(context.Background(), AddOptions{
+		Dir: src, Path: filepath.Join(".worktrees", "wt1"), Branch: "wt1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Lstat(filepath.Join(res1.Path, ".worktrees")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("first in-tree worktree copied .worktrees into itself: %v", err)
+	}
+
+	res2, err := AddWorktree(context.Background(), AddOptions{
+		Dir: src, Path: filepath.Join(".worktrees", "wt2"), Branch: "wt2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Lstat(filepath.Join(res2.Path, ".worktrees")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("second in-tree worktree copied .worktrees: %v", err)
 	}
 }
 
