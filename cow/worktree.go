@@ -146,6 +146,10 @@ type AddResult struct {
 func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
 	start := time.Now()
 
+	if err := refuseRepoEnv(); err != nil {
+		return AddResult{}, err
+	}
+
 	src, err := gitOut(ctx, opts.Dir, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return AddResult{}, refusef("not inside a Git checkout: %v", err)
@@ -777,6 +781,12 @@ func gitOut(ctx context.Context, dir string, args ...string) (string, error) {
 // "prune", which need no cloning and so are Git's own.
 func Passthrough(ctx context.Context, dir, sub string, args []string,
 	stdout, stderr io.Writer) int {
+
+	if err := refuseRepoEnv(); err != nil {
+		_, _ = fmt.Fprintf(stderr, "git-cow: %v\n", err)
+
+		return 2
+	}
 
 	cmd := exec.CommandContext(ctx, "git", append([]string{"worktree", sub}, args...)...)
 	cmd.Dir = absDir(dir)

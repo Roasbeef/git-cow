@@ -41,6 +41,13 @@ func gitTry(dir string, args ...string) (string, error) {
 func newRepo(t *testing.T) string {
 	t.Helper()
 
+	for _, name := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"} {
+		if old, ok := os.LookupEnv(name); ok {
+			t.Cleanup(func() { _ = os.Setenv(name, old) })
+			_ = os.Unsetenv(name)
+		}
+	}
+
 	for k, v := range map[string]string{
 		"GIT_CONFIG_NOSYSTEM": "1",
 		"GIT_CONFIG_GLOBAL":   os.DevNull,
@@ -459,5 +466,121 @@ func TestAddUntrackedHelp(t *testing.T) {
 
 	if !strings.Contains(out.String(), "--untracked") {
 		t.Errorf("usage does not mention --untracked:\n%s", out.String())
+	}
+}
+
+// TestAddRefusesRepositoryEnvironment checks that each variable which would
+// redirect Git to another repository makes add refuse, names the variable,
+// and leaves the source, index included, unchanged and no destination.
+func TestAddRefusesRepositoryEnvironment(t *testing.T) {
+	for _, name := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"} {
+		t.Run(name, func(t *testing.T) {
+			src := newRepo(t)
+
+			if err := os.WriteFile(filepath.Join(src, "notes.txt"), []byte("mine\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			value := src
+			switch name {
+			case "GIT_DIR", "GIT_COMMON_DIR":
+				value = filepath.Join(src, ".git")
+
+			case "GIT_INDEX_FILE":
+				value = filepath.Join(src, ".git", "index")
+			}
+
+			before := treeBytes(t, src)
+
+			t.Setenv(name, value)
+
+			code, _, errOut := cli(t, src, "add", "-b", "feat", "../wt")
+			if code != exitRefused {
+				t.Errorf("status %d, want %d: %s", code, exitRefused, errOut)
+			}
+
+			if !strings.Contains(errOut, name) {
+				t.Errorf("stderr %q does not name %s", errOut, name)
+			}
+
+			if _, err := os.Lstat(filepath.Join(filepath.Dir(src), "wt")); err == nil {
+				t.Error("destination was created")
+			}
+
+			if after := treeBytes(t, src); after != before {
+				t.Errorf("the source changed:\n%s\n---\n%s", before, after)
+			}
+
+			// Every other subcommand refuses too.
+			for _, sub := range []string{"list", "prune"} {
+				if code, _, errOut := cli(t, src, sub); code != exitRefused || !strings.Contains(errOut, name) {
+					t.Errorf("%s: status %d: %s", sub, code, errOut)
+				}
+			}
+
+			if code, _, errOut := cli(t, src, "copy", ".", "../copy"); code != exitRefused || !strings.Contains(errOut, name) {
+				t.Errorf("copy: status %d: %s", code, errOut)
+			}
+		})
+	}
+}
+
+// treeBytes returns every file under dir, the Git directory and its index
+// included, as one string of paths and contents, except the Git directory's
+// lock and log churn that reading cannot cause.
+func treeBytes(t *testing.T, dir string) string {
+	t.Helper()
+
+	var b strings.Builder
+
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+
+		rel, _ := filepath.Rel(dir, p)
+		fmt.Fprintf(&b, "%s %d %x\n", rel, len(data), data)
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return b.String()
+}
+
+// TestGitDashCExportsNoRepositoryEnvironment checks the premise of the
+// refusal: git runs an external subcommand given only -C, or from inside a
+// checkout, without exporting any of the variables, so "git -C <repo> cow"
+// keeps working.
+func TestGitDashCExportsNoRepositoryEnvironment(t *testing.T) {
+	src := newRepo(t)
+	bin := t.TempDir()
+
+	script := "#!/bin/sh\nenv | grep -E '^GIT_(DIR|WORK_TREE|INDEX_FILE|COMMON_DIR)=' || true\npwd\n"
+	if err := os.WriteFile(filepath.Join(bin, "git-cow"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	for _, args := range [][]string{{"-C", src, "cow"}, {"cow"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = src
+
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+
+		if strings.Contains(string(out), "GIT_") {
+			t.Errorf("git %v exported a repository variable:\n%s", args, out)
+		}
 	}
 }

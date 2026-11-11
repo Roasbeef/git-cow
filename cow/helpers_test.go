@@ -15,6 +15,8 @@ import (
 func isolateGit(t testing.TB) {
 	t.Helper()
 
+	clearRepoEnv(t)
+
 	for k, v := range map[string]string{
 		"GIT_CONFIG_NOSYSTEM": "1",
 		"GIT_CONFIG_GLOBAL":   os.DevNull,
@@ -175,5 +177,19 @@ func requireClone(t testing.TB) {
 		}
 
 		t.Fatal(err)
+	}
+}
+
+// clearRepoEnv unsets the variables that redirect Git to another repository,
+// for the rest of the test, so a test run from inside a Git hook is not
+// pointed at the hook's repository. refuseRepoEnv would refuse them anyway.
+func clearRepoEnv(t testing.TB) {
+	t.Helper()
+
+	for _, name := range repoEnvVars {
+		if old, ok := os.LookupEnv(name); ok {
+			t.Cleanup(func() { _ = os.Setenv(name, old) })
+			_ = os.Unsetenv(name)
+		}
 	}
 }

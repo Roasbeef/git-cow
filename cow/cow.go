@@ -97,6 +97,10 @@ var (
 func Copy(ctx context.Context, template, dest string, opts Options) (Result, error) {
 	start := time.Now()
 
+	if err := refuseRepoEnv(); err != nil {
+		return Result{}, err
+	}
+
 	tpl, dst, err := resolvePaths(template, dest)
 	if err != nil {
 		return Result{}, err
