@@ -356,10 +356,10 @@ func TestWorktreePassthroughAndFlags(t *testing.T) {
 	}
 }
 
-// TestAddUntrackedFlag checks the default leaves untracked files behind and
-// --untracked carries them, and that git worktree remove needs --force only
-// in the second case.
-func TestAddUntrackedFlag(t *testing.T) {
+// TestAddDefaultLeavesUntracked checks the default on every platform: the
+// untracked file is not in the new worktree, status is clean, and neither
+// git nor git-cow needs --force to remove it.
+func TestAddDefaultLeavesUntracked(t *testing.T) {
 	src := newRepo(t)
 
 	if err := os.WriteFile(filepath.Join(src, "notes.txt"), []byte("mine\n"), 0o644); err != nil {
@@ -380,16 +380,56 @@ func TestAddUntrackedFlag(t *testing.T) {
 		t.Errorf("status = %q, want clean", got)
 	}
 
-	// Neither git nor git-cow needs --force to remove it.
 	if code, _, errOut := cli(t, src, "remove", "../plain"); code != 0 {
 		t.Fatalf("remove: %d %s", code, errOut)
 	}
 
-	if code, _, errOut := cli(t, src, "add", "--untracked", "-b", "carried", "../carried"); code != 0 {
+	if body, err := os.ReadFile(filepath.Join(src, "notes.txt")); err != nil || string(body) != "mine\n" {
+		t.Errorf("the source's file: %q, %v", body, err)
+	}
+}
+
+// TestAddUntrackedFlag checks --untracked by the method the add used. When
+// files were cloned the untracked file comes along and remove needs --force.
+// When the add fell back to plain git worktree add, the flag is a no-op.
+func TestAddUntrackedFlag(t *testing.T) {
+	src := newRepo(t)
+
+	if err := os.WriteFile(filepath.Join(src, "notes.txt"), []byte("mine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, errOut := cli(t, src, "add", "--untracked", "--json", "-b", "carried", "../carried")
+	if code != 0 {
 		t.Fatalf("add --untracked: %d %s", code, errOut)
 	}
 
-	if body, err := os.ReadFile(filepath.Join(parent, "carried", "notes.txt")); err != nil || string(body) != "mine\n" {
+	var added struct {
+		Path   string `json:"path"`
+		Method string `json:"method"`
+	}
+
+	if err := json.Unmarshal([]byte(out), &added); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("add used method %q", added.Method)
+
+	body, err := os.ReadFile(filepath.Join(added.Path, "notes.txt"))
+
+	if added.Method == cow.MethodWorktree {
+		if err == nil {
+			t.Error("the plain path carried an untracked file")
+		}
+
+		if code, _, errOut := cli(t, src, "remove", "../carried"); code != 0 {
+			t.Fatalf("remove: %d %s", code, errOut)
+		}
+
+		return
+	}
+
+	if err != nil || string(body) != "mine\n" {
 		t.Errorf("--untracked: %q, %v", body, err)
 	}
 
@@ -399,10 +439,6 @@ func TestAddUntrackedFlag(t *testing.T) {
 
 	if code, _, errOut := cli(t, src, "remove", "--force", "../carried"); code != 0 {
 		t.Fatalf("remove --force: %d %s", code, errOut)
-	}
-
-	if body, err := os.ReadFile(filepath.Join(src, "notes.txt")); err != nil || string(body) != "mine\n" {
-		t.Errorf("the source's file: %q, %v", body, err)
 	}
 }
 
