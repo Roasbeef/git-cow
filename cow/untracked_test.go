@@ -500,54 +500,105 @@ func TestAddThenRemoveNeedsNoForce(t *testing.T) {
 	}
 }
 
-// TestCleanGuard violates each guard condition in turn, through the test
-// seam, and checks nothing is cleaned and the add fails.
+// TestCleanGuard runs cleanGuard against pairs of real repositories and
+// checks it refuses everything but a checkout root that is not the source.
 func TestCleanGuard(t *testing.T) {
-	requireClone(t)
+	src := newRepo(t)
+	other := newRepo(t)
+	write(t, filepath.Join(other, "sub", "keep.txt"), "keep\n")
+
+	// A linked worktree is its own checkout root.
+	linked := filepath.Join(filepath.Dir(src), "linked")
+	git(t, src, "worktree", "add", "-q", "--detach", linked)
 
 	cases := []struct {
-		name string
-		hook func(other string) func(src, dest *string, fresh *bool)
+		name      string
+		src, dest string
+		ok        bool
 	}{
-		{"destination is the source", func(string) func(src, dest *string, fresh *bool) {
-			return func(src, dest *string, fresh *bool) { *dest = *src }
-		}},
-		{"destination is not a checkout root", func(other string) func(src, dest *string, fresh *bool) {
-			return func(src, dest *string, fresh *bool) { *dest = filepath.Join(other, "sub") }
-		}},
-		{"destination was not fresh", func(other string) func(src, dest *string, fresh *bool) {
-			return func(src, dest *string, fresh *bool) { *dest = other; *fresh = false }
-		}},
-		{"destination is another checkout", func(other string) func(src, dest *string, fresh *bool) {
-			return func(src, dest *string, fresh *bool) { *dest = other; *src = other }
-		}},
+		{"a different checkout root", src, other, true},
+		{"a linked worktree", src, linked, true},
+		{"the source itself", src, src, false},
+		{"the source through a symlink", src, symlinkTo(t, src), false},
+		{"a subdirectory of a checkout", src, filepath.Join(other, "sub"), false},
+		{"a subdirectory of the source", src, filepath.Join(src, "src"), false},
+		{"not a repository", src, t.TempDir(), false},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			src := newRepo(t)
-			write(t, filepath.Join(src, "notes.txt"), "mine\n")
-
-			other := newRepo(t)
-			write(t, filepath.Join(other, "sub", "keep.txt"), "keep\n")
-			write(t, filepath.Join(other, "other.txt"), "keep\n")
-
-			before, beforeOther := snapshot(t, src), snapshot(t, other)
-
-			beforeCleanHook = c.hook(other)
-			t.Cleanup(func() { beforeCleanHook = nil })
-
-			if _, err := addTo(t, src, "wt", AddOptions{Branch: "feat"}); err == nil {
-				t.Fatal("add succeeded with a violated guard")
+			err := cleanGuard(context.Background(), c.src, c.dest)
+			if (err == nil) != c.ok {
+				t.Errorf("cleanGuard = %v, want ok=%v", err, c.ok)
 			}
-
-			if exists(filepath.Join(filepath.Dir(src), "wt")) {
-				t.Error("the destination remains after the failure")
-			}
-
-			sameSnapshot(t, "the source", before, snapshot(t, src))
-			sameSnapshot(t, "the other checkout", beforeOther, snapshot(t, other))
 		})
+	}
+}
+
+// symlinkTo returns a symlink to dir in a fresh directory.
+func symlinkTo(t *testing.T, dir string) string {
+	t.Helper()
+
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+
+	return link
+}
+
+// TestAddReadOnlyUntrackedDirectory checks that an untracked read-only
+// directory, which git clean cannot empty, fails the add with a message that
+// names the path and offers --untracked, rolls everything back, and leaves
+// the source untouched.
+func TestAddReadOnlyUntrackedDirectory(t *testing.T) {
+	requireClone(t)
+
+	if os.Geteuid() == 0 {
+		t.Skip("root can remove files in a read-only directory")
+	}
+
+	src := newRepo(t)
+	ro := filepath.Join(src, "ro")
+	write(t, filepath.Join(ro, "f"), "r\n")
+
+	if err := os.Chmod(ro, 0o555); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = os.Chmod(ro, 0o755) })
+
+	before := snapshot(t, src)
+
+	_, err := addTo(t, src, "wt", AddOptions{Branch: "feat"})
+	if err == nil {
+		t.Fatal("add succeeded")
+	}
+
+	if !strings.Contains(err.Error(), "ro/f") || !strings.Contains(err.Error(), "--untracked") {
+		t.Errorf("err = %v, want the path and --untracked named", err)
+	}
+
+	dest := filepath.Join(filepath.Dir(src), "wt")
+	if exists(dest) {
+		t.Error("destination remains after the failure")
+	}
+
+	if _, err := gitErr(src, "rev-parse", "--verify", "feat"); err == nil {
+		t.Error("branch remains after the failure")
+	}
+
+	if listed(t, src, dest) {
+		t.Error("worktree record remains after the failure")
+	}
+
+	sameSnapshot(t, "the source", before, snapshot(t, src))
+
+	// --untracked keeps the directory and works.
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(dest, "ro"), 0o755) })
+
+	if _, err := addTo(t, src, "wt", AddOptions{Branch: "feat", Untracked: true}); err != nil {
+		t.Errorf("with --untracked: %v", err)
 	}
 }
 

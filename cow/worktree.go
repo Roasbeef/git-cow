@@ -133,8 +133,8 @@ type AddResult struct {
 // the source's notes and scratch files are gone, a nested repository's copy
 // is gone, and ignored files stay. A file the requested commit does not
 // ignore but the source's HEAD does is also removed. Only the new worktree
-// is ever cleaned, and only after cleanGuard has confirmed that it is the
-// directory this call made. The source is never written.
+// is ever cleaned, and only after cleanGuard has confirmed that it is a
+// checkout root other than the source. The source is never written.
 //
 // The source must have no staged or unstaged changes to tracked files. That
 // is the one state in which its files are exactly its HEAD commit, so the
@@ -188,7 +188,6 @@ func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
 		return addPlain(ctx, src, dest, opts, start)
 	}
 
-	freshDest := destIsFresh(dest)
 	existedBefore := branchExistedBeforeAdd(ctx, src, dest, opts)
 	createdParent := missingSubtreeRoot(src, dest)
 
@@ -196,7 +195,7 @@ func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
 		return AddResult{}, err
 	}
 
-	res, err := populateWorktree(ctx, src, srcHead, dest, createdParent, freshDest, opts)
+	res, err := populateWorktree(ctx, src, srcHead, dest, createdParent, opts)
 	if err != nil {
 		rollbackAdd(src, dest, createdParent, existedBefore)
 
@@ -211,7 +210,7 @@ func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
 // populateWorktree fills the empty worktree dest from src and checks the
 // result against its HEAD.
 func populateWorktree(ctx context.Context, src, srcHead, dest, createdParent string,
-	freshDest bool, opts AddOptions) (AddResult, error) {
+	opts AddOptions) (AddResult, error) {
 
 	gitlinks, err := gitlinkPaths(ctx, src)
 	if err != nil {
@@ -288,24 +287,12 @@ func populateWorktree(ctx context.Context, src, srcHead, dest, createdParent str
 	}
 
 	if !opts.Untracked {
-		if err := cleanUntracked(ctx, src, dest, freshDest); err != nil {
+		if err := cleanUntracked(ctx, src, dest); err != nil {
 			return AddResult{}, err
 		}
 	}
 
 	return AddResult{Method: w.method(), Path: dest, Files: w.files, Bytes: w.bytes, Head: head}, nil
-}
-
-// beforeCleanHook lets tests change what cleanUntracked is about to guard
-// and clean. Production code leaves it nil.
-var beforeCleanHook func(src, dest *string, fresh *bool)
-
-// destIsFresh reports whether dest is absent or an empty directory, the only
-// two states in which everything in it afterwards came from this call.
-func destIsFresh(dest string) bool {
-	entries, err := os.ReadDir(dest)
-
-	return errors.Is(err, os.ErrNotExist) || (err == nil && len(entries) == 0)
 }
 
 // cleanUntracked removes what Git considers untracked and not ignored from
@@ -314,13 +301,9 @@ func destIsFresh(dest string) bool {
 // "-ff" is needed to remove an untracked nested repository, and "-x" is
 // absent so ignored files, the build output, stay. The target is passed with
 // -C and no pathspec is given. Before running, cleanGuard checks that dest is
-// the worktree this call created and not the source.
-func cleanUntracked(ctx context.Context, src, dest string, fresh bool) error {
-	if beforeCleanHook != nil {
-		beforeCleanHook(&src, &dest, &fresh)
-	}
-
-	if err := cleanGuard(ctx, src, dest, fresh); err != nil {
+// a checkout of its own and not the source.
+func cleanUntracked(ctx context.Context, src, dest string) error {
+	if err := cleanGuard(ctx, src, dest); err != nil {
 		return err
 	}
 
@@ -330,7 +313,8 @@ func cleanUntracked(ctx context.Context, src, dest string, fresh bool) error {
 	for range maxCleanPasses {
 		removed, err := gitOut(ctx, dest, "-C", dest, "clean", "-ffd")
 		if err != nil {
-			return err
+			return fmt.Errorf("removing untracked files from the new worktree failed "+
+				"(use --untracked to keep untracked files instead): %w", err)
 		}
 
 		if removed == "" {
@@ -345,13 +329,8 @@ func cleanUntracked(ctx context.Context, src, dest string, fresh bool) error {
 // peels one layer of untracked ignore files, so real trees need two.
 const maxCleanPasses = 8
 
-// cleanGuard fails unless dest is a checkout of its own, distinct from src,
-// that did not exist with content before this call.
-func cleanGuard(ctx context.Context, src, dest string, fresh bool) error {
-	if !fresh {
-		return fmt.Errorf("refusing to clean %q: it existed before this call", dest)
-	}
-
+// cleanGuard fails unless dest is the root of a checkout that is not src.
+func cleanGuard(ctx context.Context, src, dest string) error {
 	top, err := gitOut(ctx, dest, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return fmt.Errorf("refusing to clean %q: %w", dest, err)
