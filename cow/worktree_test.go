@@ -42,10 +42,10 @@ var addModes = []struct {
 	{"walk", AddOptions{forceWalk: true}},
 }
 
-// TestAddCarriesUntrackedFiles checks that ignored and untracked files come
-// along, the worktree is registered with Git and is clean, and a write on
-// one side stays on that side.
-func TestAddCarriesUntrackedFiles(t *testing.T) {
+// TestAddCarriesIgnoredLeavesUntracked checks that ignored files come along
+// and untracked files do not, the worktree is registered with Git and shows
+// nothing untracked, and a write on one side stays on that side.
+func TestAddCarriesIgnoredLeavesUntracked(t *testing.T) {
 	requireClone(t)
 
 	for _, mode := range addModes {
@@ -70,8 +70,12 @@ func TestAddCarriesUntrackedFiles(t *testing.T) {
 				t.Errorf("ignored artifact holds %q", got)
 			}
 
-			if got := read(t, filepath.Join(res.Path, "notes.txt")); got != "untracked\n" {
-				t.Errorf("untracked file holds %q", got)
+			if _, err := os.Lstat(filepath.Join(res.Path, "notes.txt")); err == nil {
+				t.Error("the untracked file was carried")
+			}
+
+			if got := read(t, filepath.Join(src, "notes.txt")); got != "untracked\n" {
+				t.Errorf("the source's untracked file holds %q", got)
 			}
 
 			if !listed(t, src, res.Path) {
@@ -82,8 +86,8 @@ func TestAddCarriesUntrackedFiles(t *testing.T) {
 				t.Errorf("branch = %q", got)
 			}
 
-			if got := git(t, res.Path, "status", "--porcelain"); got != "?? notes.txt" {
-				t.Errorf("status = %q, want only the untracked file", got)
+			if got := git(t, res.Path, "status", "--porcelain"); got != "" {
+				t.Errorf("status = %q, want clean", got)
 			}
 
 			if res.Head != head(t, src) {
@@ -109,8 +113,8 @@ func TestAddCarriesUntrackedFiles(t *testing.T) {
 }
 
 // TestAddMatchesCommitish creates a worktree at an older commit and checks the
-// tracked files are those of that commit, as git worktree add gives, while the
-// untracked file from the source is kept.
+// tracked files are those of that commit, as git worktree add gives, and the
+// untracked file from the source is left behind.
 func TestAddMatchesCommitish(t *testing.T) {
 	requireClone(t)
 
@@ -143,8 +147,8 @@ func TestAddMatchesCommitish(t *testing.T) {
 				t.Error("c.txt exists but is not in the commit")
 			}
 
-			if got := git(t, res.Path, "status", "--porcelain"); got != "?? notes.txt" {
-				t.Errorf("status = %q", got)
+			if got := git(t, res.Path, "status", "--porcelain"); got != "" {
+				t.Errorf("status = %q, want clean", got)
 			}
 
 			// A plain checkout of the same commit has the same tracked files.

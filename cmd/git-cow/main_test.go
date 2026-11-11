@@ -355,3 +355,73 @@ func TestWorktreePassthroughAndFlags(t *testing.T) {
 		t.Fatalf("repair: %d %s", code, errOut)
 	}
 }
+
+// TestAddUntrackedFlag checks the default leaves untracked files behind and
+// --untracked carries them, and that git worktree remove needs --force only
+// in the second case.
+func TestAddUntrackedFlag(t *testing.T) {
+	src := newRepo(t)
+
+	if err := os.WriteFile(filepath.Join(src, "notes.txt"), []byte("mine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := filepath.Dir(src)
+
+	if code, _, errOut := cli(t, src, "add", "-b", "plain", "../plain"); code != 0 {
+		t.Fatalf("add: %d %s", code, errOut)
+	}
+
+	if _, err := os.Lstat(filepath.Join(parent, "plain", "notes.txt")); err == nil {
+		t.Error("the untracked file was carried by default")
+	}
+
+	if got := gitRun(t, filepath.Join(parent, "plain"), "status", "--porcelain"); got != "" {
+		t.Errorf("status = %q, want clean", got)
+	}
+
+	// Neither git nor git-cow needs --force to remove it.
+	if code, _, errOut := cli(t, src, "remove", "../plain"); code != 0 {
+		t.Fatalf("remove: %d %s", code, errOut)
+	}
+
+	if code, _, errOut := cli(t, src, "add", "--untracked", "-b", "carried", "../carried"); code != 0 {
+		t.Fatalf("add --untracked: %d %s", code, errOut)
+	}
+
+	if body, err := os.ReadFile(filepath.Join(parent, "carried", "notes.txt")); err != nil || string(body) != "mine\n" {
+		t.Errorf("--untracked: %q, %v", body, err)
+	}
+
+	if code, _, _ := cli(t, src, "remove", "../carried"); code == 0 {
+		t.Error("remove succeeded with a carried untracked file")
+	}
+
+	if code, _, errOut := cli(t, src, "remove", "--force", "../carried"); code != 0 {
+		t.Fatalf("remove --force: %d %s", code, errOut)
+	}
+
+	if body, err := os.ReadFile(filepath.Join(src, "notes.txt")); err != nil || string(body) != "mine\n" {
+		t.Errorf("the source's file: %q, %v", body, err)
+	}
+}
+
+// TestAddUntrackedHelp checks the flag is in the help text.
+func TestAddUntrackedHelp(t *testing.T) {
+	var out, errb bytes.Buffer
+
+	if code := run(context.Background(), []string{"add", "--help"}, &out, &errb); code != 0 {
+		t.Fatalf("status %d", code)
+	}
+
+	if !strings.Contains(out.String(), "--untracked") {
+		t.Errorf("help does not mention --untracked:\n%s", out.String())
+	}
+
+	out.Reset()
+	run(context.Background(), []string{"help"}, &out, &errb)
+
+	if !strings.Contains(out.String(), "--untracked") {
+		t.Errorf("usage does not mention --untracked:\n%s", out.String())
+	}
+}

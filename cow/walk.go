@@ -9,7 +9,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strings"
 )
 
 // walker copies a tree entry by entry. It is the Linux strategy, the
@@ -19,8 +18,13 @@ type walker struct {
 	opts Options
 
 	// skip holds slash-separated paths, relative to the walk root, that are
-	// left out of the copy. A skipped path is not created at all.
+	// left out of the copy. A skipped path is not created at all. Paths are
+	// added with addSkip, which also keeps skipParents current.
 	skip map[string]struct{}
+
+	// skipParents holds every proper ancestor directory of a skipped path,
+	// so containsSkip is one lookup however many paths are skipped.
+	skipParents map[string]struct{}
 
 	// skipSpecial leaves out sockets, FIFOs and devices instead of
 	// refusing them. A working tree can hold a dev server's socket, which
@@ -117,15 +121,32 @@ func (w *walker) populate(ctx context.Context, src, dst, rel string) error {
 	return nil
 }
 
-// containsSkip reports whether a skipped path lies beneath the directory rel.
-func (w *walker) containsSkip(rel string) bool {
-	for k := range w.skip {
-		if strings.HasPrefix(k, rel+"/") {
-			return true
-		}
+// addSkip leaves the slash-separated path rel out of the copy.
+func (w *walker) addSkip(rel string) {
+	if w.skip == nil {
+		w.skip = make(map[string]struct{})
 	}
 
-	return false
+	if w.skipParents == nil {
+		w.skipParents = make(map[string]struct{})
+	}
+
+	w.skip[rel] = struct{}{}
+
+	for dir := path.Dir(rel); dir != "." && dir != "/"; dir = path.Dir(dir) {
+		if _, seen := w.skipParents[dir]; seen {
+			break
+		}
+
+		w.skipParents[dir] = struct{}{}
+	}
+}
+
+// containsSkip reports whether a skipped path lies beneath the directory rel.
+func (w *walker) containsSkip(rel string) bool {
+	_, ok := w.skipParents[rel]
+
+	return ok
 }
 
 // copyEntry duplicates one directory entry.
@@ -168,11 +189,7 @@ func (w *walker) cloneWhole(from, to, rel string) (bool, error) {
 		}
 
 		if subRel, relErr := filepath.Rel(from, p); relErr == nil {
-			if w.skip == nil {
-				w.skip = make(map[string]struct{})
-			}
-
-			w.skip[path.Join(rel, filepath.ToSlash(subRel))] = struct{}{}
+			w.addSkip(path.Join(rel, filepath.ToSlash(subRel)))
 		}
 
 		return nil

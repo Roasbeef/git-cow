@@ -4,7 +4,8 @@
 // "copy" makes an independent repository, which is the safe choice for code
 // you do not trust. "add", "list", "remove", "prune", "move", "lock",
 // "unlock" and "repair" mirror "git worktree" and share the source's Git
-// directory.
+// directory. "add" clones ignored files such as build output and leaves the
+// source's untracked files behind unless "--untracked" asks for them.
 package main
 
 import (
@@ -37,9 +38,10 @@ commands:
         make an independent repository that shares disk blocks
   add [-b <branch>] [-B <branch>] [-d|--detach] [-f|--force] [-q|--quiet]
       [--lock [--reason <string>]] [--track|--no-track]
-      [--guess-remote|--no-guess-remote] [--require-cow] [--json]
-      <path> [<commit-ish>]
-        make a linked worktree whose files are clones of this checkout
+      [--guess-remote|--no-guess-remote] [--require-cow] [--untracked]
+      [--json] <path> [<commit-ish>]
+        make a linked worktree whose files are clones of this checkout;
+        untracked files stay behind unless --untracked is given
   list [--porcelain]         same as git worktree list
   remove [--force] <path>    same as git worktree remove
   prune                      same as git worktree prune
@@ -53,7 +55,8 @@ const copyUsage = "usage: git-cow copy [--require-cow] [--json] <template> <dest
 
 const addUsage = "usage: git-cow add [-b <branch>] [-B <branch>] [--detach] " +
 	"[--force] [--quiet] [--lock [--reason <string>]] [--track|--no-track] " +
-	"[--guess-remote|--no-guess-remote] [--require-cow] [--json] <path> [<commit-ish>]\n"
+	"[--guess-remote|--no-guess-remote] [--require-cow] [--untracked] [--json] " +
+	"<path> [<commit-ish>]\n"
 
 func main() {
 	ctx, stop := signalContext()
@@ -272,6 +275,9 @@ func runAdd(ctx context.Context, dir string, args []string, stdout, stderr io.Wr
 
 		case arg == "--require-cow":
 			opts.RequireCOW = true
+
+		case arg == "--untracked":
+			opts.Untracked = true
 
 		case arg == "--json":
 			asJSON = true

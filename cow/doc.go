@@ -10,4 +10,10 @@
 // clonefile(2) on macOS or the FICLONE ioctl on Linux. Where it does not, the
 // package falls back to an ordinary byte copy, unless the caller asked for
 // copy-on-write only.
+//
+// Copy makes an independent repository and carries everything in the
+// template, untracked files included. AddWorktree makes a linked worktree
+// and carries ignored files such as build output but, unless the caller sets
+// AddOptions.Untracked, leaves the source's untracked files behind, because
+// in a new worktree they are one "git add -A" from a commit.
 package cow

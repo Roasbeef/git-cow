@@ -186,13 +186,10 @@ func build(ctx context.Context, tpl, tree string, stats treeStats,
 		removeAll(tree)
 	}
 
-	w := &walker{
-		opts: opts,
-		skip: map[string]struct{}{
-			".git/worktrees":             {},
-			".git/fsmonitor--daemon.ipc": {},
-		},
-	}
+	w := &walker{opts: opts}
+	w.addSkip(".git/worktrees")
+	w.addSkip(".git/fsmonitor--daemon.ipc")
+
 	if err := w.copyDir(ctx, tpl, tree, ""); err != nil {
 		return "", err
 	}

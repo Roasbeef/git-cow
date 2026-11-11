@@ -83,6 +83,12 @@ type AddOptions struct {
 	// back to plain "git worktree add".
 	RequireCOW bool
 
+	// Untracked carries the source's untracked files that are not ignored
+	// into the new worktree. By default they are left behind, so the new
+	// worktree has nothing for "git add -A" to sweep into a commit.
+	// Ignored files such as build output are carried either way.
+	Untracked bool
+
 	// The fields below let the package tests force paths that the host
 	// filesystem would not otherwise take.
 	forceWalk  bool
@@ -115,16 +121,30 @@ type AddResult struct {
 // Git's own metadata is made by "git worktree add --no-checkout", so Git's
 // refusals (a branch checked out elsewhere, an existing path) and its
 // "list", "remove" and "prune" all apply unchanged. The working tree is then
-// filled by cloning the source checkout, so untracked and ignored files such
-// as build output come along, and made to match the requested commit the way
-// a checkout would.
+// filled by cloning the source checkout, so ignored files such as build
+// output come along, and made to match the requested commit the way a
+// checkout would.
+//
+// Untracked files that are not ignored, the ones "git status" shows as "??",
+// are left behind unless opts.Untracked is set. They are a person's own
+// notes and scratch files, and in a new worktree they would be one
+// "git add -A" from a commit. Git decides which files they are, with
+// "git ls-files --others --exclude-standard", and the walk then leaves those
+// paths out of the copy. Nothing is ever deleted: the source is only read,
+// and the destination is built without the files instead of cleaned after.
+// A wholly untracked directory is not created. A directory that also holds
+// ignored files is created with only those. An untracked nested repository,
+// which Git lists as one entry, is left behind whole and never entered.
+// Afterwards Git is asked again, in the new worktree, and the add fails and
+// is rolled back if anything untracked is there.
 //
 // The source must have no staged or unstaged changes to tracked files. That
 // is the one state in which its files are exactly its HEAD commit, so the
 // result can be made to match any commit-ish with a hard reset that rewrites
-// only the files which differ. Untracked files are copied and are not
-// protected from that reset: a commit-ish that tracks a path where the source
-// has an untracked file replaces it.
+// only the files which differ. With opts.Untracked, the copied untracked
+// files are not protected from that reset: a commit-ish that tracks a path
+// where the source has an untracked file replaces it. Without it, the file
+// was never copied and the reset creates the tracked one.
 //
 // A submodule is left as an empty directory, as "git worktree add" leaves it.
 func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
@@ -160,16 +180,16 @@ func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
 		return AddResult{}, err
 	}
 
+	existedBefore := branchExistedBeforeAdd(ctx, src, dest, opts)
+	createdParent := missingSubtreeRoot(src, dest)
+
 	if !supported {
 		if opts.RequireCOW {
 			return AddResult{}, fmt.Errorf("%w: the filesystem cannot clone files", ErrNoCoW)
 		}
 
-		return addPlain(ctx, src, dest, opts, start)
+		return addPlain(ctx, src, dest, createdParent, existedBefore, opts, start)
 	}
-
-	existedBefore := branchExistedBeforeAdd(ctx, src, dest, opts)
-	createdParent := missingSubtreeRoot(src, dest)
 
 	if err := runGit(ctx, src, addArgs(opts, dest, true)...); err != nil {
 		return AddResult{}, err
@@ -204,24 +224,36 @@ func populateWorktree(ctx context.Context, src, srcHead, dest, createdParent str
 
 	w := &walker{
 		opts:        Options{RequireCOW: opts.RequireCOW, forceNoCoW: opts.forceNoCoW},
-		skip:        map[string]struct{}{".git": {}},
 		skipSpecial: true,
 		treeClone:   hasWholeTreeClone && !opts.forceWalk && !opts.forceNoCoW,
 	}
 
+	w.addSkip(".git")
+
 	for _, p := range gitlinks {
-		w.skip[p] = struct{}{}
+		w.addSkip(p)
 	}
 
 	for _, p := range nestedWTs {
-		w.skip[p] = struct{}{}
+		w.addSkip(p)
 	}
 
 	if createdParent != "" {
-		w.skip[createdParent] = struct{}{}
+		w.addSkip(createdParent)
 	} else if within(src, dest) {
 		if rel, relErr := filepath.Rel(src, dest); relErr == nil {
-			w.skip[filepath.ToSlash(rel)] = struct{}{}
+			w.addSkip(filepath.ToSlash(rel))
+		}
+	}
+
+	if !opts.Untracked {
+		left, err := untrackedPaths(ctx, src)
+		if err != nil {
+			return AddResult{}, err
+		}
+
+		for _, p := range left {
+			w.addSkip(p)
 		}
 	}
 
@@ -266,13 +298,19 @@ func populateWorktree(ctx context.Context, src, srcHead, dest, createdParent str
 		return AddResult{}, fmt.Errorf("new worktree does not match its commit:\n%s", status)
 	}
 
+	if !opts.Untracked {
+		if err := requireNoUntracked(ctx, dest); err != nil {
+			return AddResult{}, err
+		}
+	}
+
 	return AddResult{Method: w.method(), Path: dest, Files: w.files, Bytes: w.bytes, Head: head}, nil
 }
 
 // addPlain makes the worktree with plain Git, for filesystems that cannot
 // clone.
-func addPlain(ctx context.Context, src, dest string, opts AddOptions,
-	start time.Time) (AddResult, error) {
+func addPlain(ctx context.Context, src, dest, createdParent string,
+	existedBefore bool, opts AddOptions, start time.Time) (AddResult, error) {
 
 	if err := runGit(ctx, src, addArgs(opts, dest, false)...); err != nil {
 		return AddResult{}, err
@@ -281,6 +319,16 @@ func addPlain(ctx context.Context, src, dest string, opts AddOptions,
 	head, err := gitOut(ctx, dest, "rev-parse", "--verify", "HEAD")
 	if err != nil {
 		return AddResult{}, err
+	}
+
+	// A checkout holds no untracked files, which is already the default.
+	// Asking for them means copying them over, one by one.
+	if opts.Untracked {
+		if err := copyUntracked(ctx, src, dest); err != nil {
+			rollbackAdd(src, dest, createdParent, existedBefore)
+
+			return AddResult{}, err
+		}
 	}
 
 	return AddResult{Method: MethodWorktree, Path: dest, Elapsed: time.Since(start), Head: head}, nil
