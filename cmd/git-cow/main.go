@@ -5,7 +5,7 @@
 // you do not trust. "add", "list", "remove", "prune", "move", "lock",
 // "unlock" and "repair" mirror "git worktree" and share the source's Git
 // directory. "add" clones ignored files such as build output and leaves the
-// source's untracked files behind unless "--untracked" asks for them.
+// source's untracked files out of the new worktree unless "--untracked" asks for them.
 package main
 
 import (
@@ -41,7 +41,8 @@ commands:
       [--guess-remote|--no-guess-remote] [--require-cow] [--untracked]
       [--json] <path> [<commit-ish>]
         make a linked worktree whose files are clones of this checkout;
-        untracked files stay behind unless --untracked is given
+        untracked files are removed from it unless --untracked is given
+        (no effect where files cannot be cloned)
   list [--porcelain]         same as git worktree list
   remove [--force] <path>    same as git worktree remove
   prune                      same as git worktree prune

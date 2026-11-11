@@ -14,6 +14,7 @@
 // Copy makes an independent repository and carries everything in the
 // template, untracked files included. AddWorktree makes a linked worktree
 // and carries ignored files such as build output but, unless the caller sets
-// AddOptions.Untracked, leaves the source's untracked files behind, because
-// in a new worktree they are one "git add -A" from a commit.
+// AddOptions.Untracked, removes the untracked files that came with the clone
+// from the new worktree, because there they are one "git add -A" from a
+// commit.
 package cow

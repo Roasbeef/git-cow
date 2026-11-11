@@ -182,8 +182,8 @@ func untrackedBenchRepo(b *testing.B) string {
 }
 
 // BenchmarkAddWorktreeUntracked times AddWorktree on a repository with a
-// large ignored build directory and many untracked files, once leaving the
-// untracked files behind (the default) and once carrying them.
+// large ignored build directory and many untracked files, once cleaning the
+// untracked files out (the default) and once keeping them.
 func BenchmarkAddWorktreeUntracked(b *testing.B) {
 	src := untrackedBenchRepo(b)
 
@@ -191,8 +191,8 @@ func BenchmarkAddWorktreeUntracked(b *testing.B) {
 		name      string
 		untracked bool
 	}{
-		{"left-behind", false},
-		{"carried", true},
+		{"cleaned", false},
+		{"kept", true},
 	} {
 		b.Run(mode.name, func(b *testing.B) {
 			parent := b.TempDir()

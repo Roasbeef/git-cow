@@ -83,10 +83,11 @@ type AddOptions struct {
 	// back to plain "git worktree add".
 	RequireCOW bool
 
-	// Untracked carries the source's untracked files that are not ignored
-	// into the new worktree. By default they are left behind, so the new
-	// worktree has nothing for "git add -A" to sweep into a commit.
-	// Ignored files such as build output are carried either way.
+	// Untracked keeps the source's untracked files, the ones "git status"
+	// shows as "??", in the new worktree. By default they are removed from
+	// it after the clone. Ignored files such as build output stay either
+	// way. It has no effect where files cannot be cloned, because plain
+	// "git worktree add" never held untracked or ignored files.
 	Untracked bool
 
 	// The fields below let the package tests force paths that the host
@@ -125,26 +126,21 @@ type AddResult struct {
 // output come along, and made to match the requested commit the way a
 // checkout would.
 //
-// Untracked files that are not ignored, the ones "git status" shows as "??",
-// are left behind unless opts.Untracked is set. They are a person's own
-// notes and scratch files, and in a new worktree they would be one
-// "git add -A" from a commit. Git decides which files they are, with
-// "git ls-files --others --exclude-standard", and the walk then leaves those
-// paths out of the copy. Nothing is ever deleted: the source is only read,
-// and the destination is built without the files instead of cleaned after.
-// A wholly untracked directory is not created. A directory that also holds
-// ignored files is created with only those. An untracked nested repository,
-// which Git lists as one entry, is left behind whole and never entered.
-// Afterwards Git is asked again, in the new worktree, and the add fails and
-// is rolled back if anything untracked is there.
+// Unless opts.Untracked is set, the new worktree is then cleaned with
+// "git clean -ffd" (never -x), run in the new worktree at the requested
+// commit. Git itself decides what is untracked there, by that commit's
+// ignore rules, so afterwards nothing shows as "??" in the new worktree:
+// the source's notes and scratch files are gone, a nested repository's copy
+// is gone, and ignored files stay. A file the requested commit does not
+// ignore but the source's HEAD does is also removed. Only the new worktree
+// is ever cleaned, and only after cleanGuard has confirmed that it is the
+// directory this call made. The source is never written.
 //
 // The source must have no staged or unstaged changes to tracked files. That
 // is the one state in which its files are exactly its HEAD commit, so the
 // result can be made to match any commit-ish with a hard reset that rewrites
-// only the files which differ. With opts.Untracked, the copied untracked
-// files are not protected from that reset: a commit-ish that tracks a path
-// where the source has an untracked file replaces it. Without it, the file
-// was never copied and the reset creates the tracked one.
+// only the files which differ. A commit-ish that tracks a path where the
+// source has an untracked file replaces it.
 //
 // A submodule is left as an empty directory, as "git worktree add" leaves it.
 func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
@@ -180,22 +176,23 @@ func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
 		return AddResult{}, err
 	}
 
-	existedBefore := branchExistedBeforeAdd(ctx, src, dest, opts)
-	createdParent := missingSubtreeRoot(src, dest)
-
 	if !supported {
 		if opts.RequireCOW {
 			return AddResult{}, fmt.Errorf("%w: the filesystem cannot clone files", ErrNoCoW)
 		}
 
-		return addPlain(ctx, src, dest, createdParent, existedBefore, opts, start)
+		return addPlain(ctx, src, dest, opts, start)
 	}
+
+	freshDest := destIsFresh(dest)
+	existedBefore := branchExistedBeforeAdd(ctx, src, dest, opts)
+	createdParent := missingSubtreeRoot(src, dest)
 
 	if err := runGit(ctx, src, addArgs(opts, dest, true)...); err != nil {
 		return AddResult{}, err
 	}
 
-	res, err := populateWorktree(ctx, src, srcHead, dest, createdParent, opts)
+	res, err := populateWorktree(ctx, src, srcHead, dest, createdParent, freshDest, opts)
 	if err != nil {
 		rollbackAdd(src, dest, createdParent, existedBefore)
 
@@ -210,7 +207,7 @@ func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
 // populateWorktree fills the empty worktree dest from src and checks the
 // result against its HEAD.
 func populateWorktree(ctx context.Context, src, srcHead, dest, createdParent string,
-	opts AddOptions) (AddResult, error) {
+	freshDest bool, opts AddOptions) (AddResult, error) {
 
 	gitlinks, err := gitlinkPaths(ctx, src)
 	if err != nil {
@@ -224,36 +221,24 @@ func populateWorktree(ctx context.Context, src, srcHead, dest, createdParent str
 
 	w := &walker{
 		opts:        Options{RequireCOW: opts.RequireCOW, forceNoCoW: opts.forceNoCoW},
+		skip:        map[string]struct{}{".git": {}},
 		skipSpecial: true,
 		treeClone:   hasWholeTreeClone && !opts.forceWalk && !opts.forceNoCoW,
 	}
 
-	w.addSkip(".git")
-
 	for _, p := range gitlinks {
-		w.addSkip(p)
+		w.skip[p] = struct{}{}
 	}
 
 	for _, p := range nestedWTs {
-		w.addSkip(p)
+		w.skip[p] = struct{}{}
 	}
 
 	if createdParent != "" {
-		w.addSkip(createdParent)
+		w.skip[createdParent] = struct{}{}
 	} else if within(src, dest) {
 		if rel, relErr := filepath.Rel(src, dest); relErr == nil {
-			w.addSkip(filepath.ToSlash(rel))
-		}
-	}
-
-	if !opts.Untracked {
-		left, err := untrackedPaths(ctx, src)
-		if err != nil {
-			return AddResult{}, err
-		}
-
-		for _, p := range left {
-			w.addSkip(p)
+			w.skip[filepath.ToSlash(rel)] = struct{}{}
 		}
 	}
 
@@ -299,7 +284,7 @@ func populateWorktree(ctx context.Context, src, srcHead, dest, createdParent str
 	}
 
 	if !opts.Untracked {
-		if err := requireNoUntracked(ctx, dest); err != nil {
+		if err := cleanUntracked(ctx, src, dest, freshDest); err != nil {
 			return AddResult{}, err
 		}
 	}
@@ -307,10 +292,89 @@ func populateWorktree(ctx context.Context, src, srcHead, dest, createdParent str
 	return AddResult{Method: w.method(), Path: dest, Files: w.files, Bytes: w.bytes, Head: head}, nil
 }
 
+// beforeCleanHook lets tests change what cleanUntracked is about to guard
+// and clean. Production code leaves it nil.
+var beforeCleanHook func(src, dest *string, fresh *bool)
+
+// destIsFresh reports whether dest is absent or an empty directory, the only
+// two states in which everything in it afterwards came from this call.
+func destIsFresh(dest string) bool {
+	entries, err := os.ReadDir(dest)
+
+	return errors.Is(err, os.ErrNotExist) || (err == nil && len(entries) == 0)
+}
+
+// cleanUntracked removes what Git considers untracked and not ignored from
+// the new worktree dest, which is the one destructive step of an add.
+//
+// "-ff" is needed to remove an untracked nested repository, and "-x" is
+// absent so ignored files, the build output, stay. The target is passed with
+// -C and no pathspec is given. Before running, cleanGuard checks that dest is
+// the worktree this call created and not the source.
+func cleanUntracked(ctx context.Context, src, dest string, fresh bool) error {
+	if beforeCleanHook != nil {
+		beforeCleanHook(&src, &dest, &fresh)
+	}
+
+	if err := cleanGuard(ctx, src, dest, fresh); err != nil {
+		return err
+	}
+
+	// An untracked ignore file hides files while Git scans for them, and is
+	// removed in the same pass, so what it hid is only found by the next
+	// pass. Repeat until a pass removes nothing.
+	for range maxCleanPasses {
+		removed, err := gitOut(ctx, dest, "-C", dest, "clean", "-ffd")
+		if err != nil {
+			return err
+		}
+
+		if removed == "" {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("the new worktree still held untracked files after %d cleaning passes", maxCleanPasses)
+}
+
+// maxCleanPasses bounds the repeated cleaning of cleanUntracked. Each pass
+// peels one layer of untracked ignore files, so real trees need two.
+const maxCleanPasses = 8
+
+// cleanGuard fails unless dest is a checkout of its own, distinct from src,
+// that did not exist with content before this call.
+func cleanGuard(ctx context.Context, src, dest string, fresh bool) error {
+	if !fresh {
+		return fmt.Errorf("refusing to clean %q: it existed before this call", dest)
+	}
+
+	top, err := gitOut(ctx, dest, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return fmt.Errorf("refusing to clean %q: %w", dest, err)
+	}
+
+	srcTop, err := gitOut(ctx, src, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return err
+	}
+
+	top, srcTop, want := resolveLoose(top), resolveLoose(srcTop), resolveLoose(dest)
+
+	switch {
+	case top != want:
+		return fmt.Errorf("refusing to clean %q: its checkout is %q", dest, top)
+
+	case top == srcTop:
+		return fmt.Errorf("refusing to clean %q: it is the source checkout", dest)
+	}
+
+	return nil
+}
+
 // addPlain makes the worktree with plain Git, for filesystems that cannot
 // clone.
-func addPlain(ctx context.Context, src, dest, createdParent string,
-	existedBefore bool, opts AddOptions, start time.Time) (AddResult, error) {
+func addPlain(ctx context.Context, src, dest string, opts AddOptions,
+	start time.Time) (AddResult, error) {
 
 	if err := runGit(ctx, src, addArgs(opts, dest, false)...); err != nil {
 		return AddResult{}, err
@@ -319,16 +383,6 @@ func addPlain(ctx context.Context, src, dest, createdParent string,
 	head, err := gitOut(ctx, dest, "rev-parse", "--verify", "HEAD")
 	if err != nil {
 		return AddResult{}, err
-	}
-
-	// A checkout holds no untracked files, which is already the default.
-	// Asking for them means copying them over, one by one.
-	if opts.Untracked {
-		if err := copyUntracked(ctx, src, dest); err != nil {
-			rollbackAdd(src, dest, createdParent, existedBefore)
-
-			return AddResult{}, err
-		}
 	}
 
 	return AddResult{Method: MethodWorktree, Path: dest, Elapsed: time.Since(start), Head: head}, nil

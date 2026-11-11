@@ -53,7 +53,7 @@ git-cow copy /srv/templates/app /srv/work/ticket-123
 
 Make a linked worktree with a new branch from your current checkout. Build
 output and other ignored files come along. Your untracked files, the ones
-`git status` shows as `??`, stay behind:
+`git status` shows as `??`, are removed from the new worktree:
 
 ```
 git cow add -b feature-x ../app-feature-x
@@ -142,40 +142,36 @@ scratch scripts and half-written files. If they came along they would show up
 as untracked in the new worktree, a later `git add -A` or a tool that edits a
 file it found there would put them in a commit, and they would be pushed.
 They would also make `git worktree remove` refuse the worktree until you
-pass `--force`. So `add` leaves them behind. Ignored files are still cloned.
+pass `--force`. So `add` removes them from the new worktree. Ignored files stay.
 
 `--untracked` restores the old behavior and carries them too.
 
-Git decides what is untracked, by running
-`git ls-files --others --exclude-standard` in the source, so `.gitignore`
-files, `.git/info/exclude` and `core.excludesFile` all apply as they do for
-`git status`. The listed paths are left out of the copy while the source is
-cloned. Nothing is deleted from either checkout, and the source is only read.
-Afterwards Git is asked again in the new worktree, and the add fails and is
-rolled back if it lists anything untracked.
+The clone is made exactly as before, and then `add` runs `git clean -ffd`
+(never `-x`) in the new worktree, which removes what Git itself shows as `??`
+there. Only the new worktree is cleaned and the source is never written.
+Git judges the files by the ignore rules at the commit you asked for, with the
+repository's own settings, so `.gitignore` files, `.git/info/exclude`,
+`core.excludesFile` and Unicode name handling all apply as they do for
+`git status`. Before cleaning, `add` checks that the directory is the
+checkout this call created: it must be absent or empty beforehand, its
+top level must be itself, and it must not be the source. Otherwise nothing
+is cleaned and the add fails and is rolled back.
 
-- A directory that is wholly untracked is not created.
-- A directory that holds both untracked and ignored files is created with
-  only the ignored ones.
-- An untracked file inside a tracked directory is left out and its siblings
-  are cloned.
-- An untracked symlink is left out as a link and never followed.
-- An untracked nested repository is left out as a whole and never entered, so
-  nothing in it, including its own ignored files, is read or changed. A nested
-  repository that is ignored is cloned like any ignored file.
-- Names with spaces, newlines, quotes or a leading dash are handled, and so
-  are names stored in decomposed Unicode form on macOS.
+- A wholly untracked directory is gone. An untracked directory that also
+  holds ignored files stays, with only the ignored files in it.
+- An untracked symlink is removed as a link and never followed.
+- An untracked nested repository's copy is removed (that is what `-ff` is
+  for). The original in the source is not touched.
+- A file the source's `HEAD` ignores but the requested commit does not, such
+  as build output when you add a worktree at an older tag, is untracked in
+  the new worktree and is not carried.
+- An untracked `.gitignore` is removed, and so are the files it was hiding in
+  the source, since nothing hides them in the new worktree.
 - A commit-ish that tracks a path where the source has an untracked file
   gets the tracked file. With `--untracked` it replaces the copy.
-- If the source has an untracked ignore file (an untracked `.gitignore`)
-  that hides build output, the output cannot stay ignored without it, so it
-  would show as untracked in the new worktree. `add` refuses with status 2
-  and says so. Commit the ignore file or use `--untracked`.
 - Where files cannot be cloned, `add` makes the worktree with plain
-  `git worktree add`, which never held untracked files, so the default is the
-  same there. With `--untracked` the untracked files are then copied over,
-  without replacing anything the checkout made and without writing through a
-  symlink.
+  `git worktree add`, which never held untracked or ignored files, so
+  `--untracked` has no effect there.
 
 `copy` is not changed. It still copies everything in the template, untracked
 files included. It makes an independent repository, usually from a template
@@ -200,7 +196,7 @@ Further behavior:
 | --- | --- |
 | 0 | Success. |
 | 1 | Any other error, including bad usage. |
-| 2 | A refusal: unsuitable template or destination, a dirty source for `add`, or an untracked ignore file left behind by `add`. |
+| 2 | A refusal: unsuitable template or destination, or a dirty source for `add`. |
 | 3 | `--require-cow` was given and the filesystem cannot clone. |
 
 `add` returns Git's own status when Git fails (usually 128). `list`,
@@ -274,7 +270,7 @@ In this section `add.go` is `internal/worktree/add.go`, and `apfs_darwin.go` and
 | macOS | APFS only, found by running `df` and `diskutil` | Tries the clone and falls back |
 | Linux | Builds, then reports unsupported (`unsupported.go:18`) | FICLONE per file, unmeasured |
 | Non-CoW filesystem | Refuses | Falls back to a copy, or exit 3 with `--require-cow` |
-| Untracked, non-ignored files | Source refused as dirty (`add.go:100`) | Left behind by default, copied with `--untracked` |
+| Untracked, non-ignored files | Source refused as dirty (`add.go:100`) | Removed from the new worktree by default, kept with `--untracked` |
 | Dirty tracked files | Refused, or `--allow-dirty` copies them | Refused |
 | Different commit-ish than source HEAD | Refused, or `--allow-mismatched-ref` shows the difference as local changes | Tracked files made to match the commit |
 | Staged changes | Lost with `--allow-dirty` | Not applicable, a source with staged changes is refused |
