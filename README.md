@@ -79,6 +79,10 @@ git-cow [-C <dir>] repair [<path>...]
 ```
 
 `-C <dir>` runs the command as if started in `<dir>`, as Git's `-C` does.
+Every command refuses to run, with status 2, when `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_INDEX_FILE` or `GIT_COMMON_DIR` is set, because those override `-C` for
+the Git processes it starts and would make it act on another repository. Run
+from inside the checkout or use `git -C <repo> cow ...`, which sets none of them.
 
 ### copy
 
@@ -152,10 +156,12 @@ there. Only the new worktree is cleaned and the source is never written.
 Git judges the files by the ignore rules at the commit you asked for, with the
 repository's own settings, so `.gitignore` files, `.git/info/exclude`,
 `core.excludesFile` and Unicode name handling all apply as they do for
-`git status`. Before cleaning, `add` checks that the directory is the
-checkout this call created: it must be absent or empty beforehand, its
-top level must be itself, and it must not be the source. Otherwise nothing
-is cleaned and the add fails and is rolled back.
+`git status`. Before cleaning, `add` checks that the new directory is the
+root of a checkout and is not the source. Otherwise nothing is cleaned and
+the add fails and is rolled back. If `git clean` cannot remove something, for
+example an untracked read-only directory, `add` fails with git's message
+naming the path, rolls back, and leaves the source alone; use `--untracked`
+to keep untracked files instead.
 
 - A wholly untracked directory is gone. An untracked directory that also
   holds ignored files stays, with only the ignored files in it.
