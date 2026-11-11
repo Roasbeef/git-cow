@@ -83,6 +83,13 @@ type AddOptions struct {
 	// back to plain "git worktree add".
 	RequireCOW bool
 
+	// Untracked keeps the source's untracked files, the ones "git status"
+	// shows as "??", in the new worktree. By default they are removed from
+	// it after the clone. Ignored files such as build output stay either
+	// way. It has no effect where files cannot be cloned, because plain
+	// "git worktree add" never held untracked or ignored files.
+	Untracked bool
+
 	// The fields below let the package tests force paths that the host
 	// filesystem would not otherwise take.
 	forceWalk  bool
@@ -115,20 +122,33 @@ type AddResult struct {
 // Git's own metadata is made by "git worktree add --no-checkout", so Git's
 // refusals (a branch checked out elsewhere, an existing path) and its
 // "list", "remove" and "prune" all apply unchanged. The working tree is then
-// filled by cloning the source checkout, so untracked and ignored files such
-// as build output come along, and made to match the requested commit the way
-// a checkout would.
+// filled by cloning the source checkout, so ignored files such as build
+// output come along, and made to match the requested commit the way a
+// checkout would.
+//
+// Unless opts.Untracked is set, the new worktree is then cleaned with
+// "git clean -ffd" (never -x), run in the new worktree at the requested
+// commit. Git itself decides what is untracked there, by that commit's
+// ignore rules, so afterwards nothing shows as "??" in the new worktree:
+// the source's notes and scratch files are gone, a nested repository's copy
+// is gone, and ignored files stay. A file the requested commit does not
+// ignore but the source's HEAD does is also removed. Only the new worktree
+// is ever cleaned, and only after cleanGuard has confirmed that it is a
+// checkout root other than the source. The source is never written.
 //
 // The source must have no staged or unstaged changes to tracked files. That
 // is the one state in which its files are exactly its HEAD commit, so the
 // result can be made to match any commit-ish with a hard reset that rewrites
-// only the files which differ. Untracked files are copied and are not
-// protected from that reset: a commit-ish that tracks a path where the source
-// has an untracked file replaces it.
+// only the files which differ. A commit-ish that tracks a path where the
+// source has an untracked file replaces it.
 //
 // A submodule is left as an empty directory, as "git worktree add" leaves it.
 func AddWorktree(ctx context.Context, opts AddOptions) (AddResult, error) {
 	start := time.Now()
+
+	if err := refuseRepoEnv(); err != nil {
+		return AddResult{}, err
+	}
 
 	src, err := gitOut(ctx, opts.Dir, "rev-parse", "--show-toplevel")
 	if err != nil {
@@ -266,7 +286,72 @@ func populateWorktree(ctx context.Context, src, srcHead, dest, createdParent str
 		return AddResult{}, fmt.Errorf("new worktree does not match its commit:\n%s", status)
 	}
 
+	if !opts.Untracked {
+		if err := cleanUntracked(ctx, src, dest); err != nil {
+			return AddResult{}, err
+		}
+	}
+
 	return AddResult{Method: w.method(), Path: dest, Files: w.files, Bytes: w.bytes, Head: head}, nil
+}
+
+// cleanUntracked removes what Git considers untracked and not ignored from
+// the new worktree dest, which is the one destructive step of an add.
+//
+// "-ff" is needed to remove an untracked nested repository, and "-x" is
+// absent so ignored files, the build output, stay. The target is passed with
+// -C and no pathspec is given. Before running, cleanGuard checks that dest is
+// a checkout of its own and not the source.
+func cleanUntracked(ctx context.Context, src, dest string) error {
+	if err := cleanGuard(ctx, src, dest); err != nil {
+		return err
+	}
+
+	// An untracked ignore file hides files while Git scans for them, and is
+	// removed in the same pass, so what it hid is only found by the next
+	// pass. Repeat until a pass removes nothing.
+	for range maxCleanPasses {
+		removed, err := gitOut(ctx, dest, "-C", dest, "clean", "-ffd")
+		if err != nil {
+			return fmt.Errorf("removing untracked files from the new worktree failed "+
+				"(use --untracked to keep untracked files instead): %w", err)
+		}
+
+		if removed == "" {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("the new worktree still held untracked files after %d cleaning passes", maxCleanPasses)
+}
+
+// maxCleanPasses bounds the repeated cleaning of cleanUntracked. Each pass
+// peels one layer of untracked ignore files, so real trees need two.
+const maxCleanPasses = 8
+
+// cleanGuard fails unless dest is the root of a checkout that is not src.
+func cleanGuard(ctx context.Context, src, dest string) error {
+	top, err := gitOut(ctx, dest, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return fmt.Errorf("refusing to clean %q: %w", dest, err)
+	}
+
+	srcTop, err := gitOut(ctx, src, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return err
+	}
+
+	top, srcTop, want := resolveLoose(top), resolveLoose(srcTop), resolveLoose(dest)
+
+	switch {
+	case top != want:
+		return fmt.Errorf("refusing to clean %q: its checkout is %q", dest, top)
+
+	case top == srcTop:
+		return fmt.Errorf("refusing to clean %q: it is the source checkout", dest)
+	}
+
+	return nil
 }
 
 // addPlain makes the worktree with plain Git, for filesystems that cannot
@@ -675,6 +760,12 @@ func gitOut(ctx context.Context, dir string, args ...string) (string, error) {
 // "prune", which need no cloning and so are Git's own.
 func Passthrough(ctx context.Context, dir, sub string, args []string,
 	stdout, stderr io.Writer) int {
+
+	if err := refuseRepoEnv(); err != nil {
+		_, _ = fmt.Fprintf(stderr, "git-cow: %v\n", err)
+
+		return 2
+	}
 
 	cmd := exec.CommandContext(ctx, "git", append([]string{"worktree", sub}, args...)...)
 	cmd.Dir = absDir(dir)

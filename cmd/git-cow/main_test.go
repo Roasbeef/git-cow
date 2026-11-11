@@ -41,6 +41,13 @@ func gitTry(dir string, args ...string) (string, error) {
 func newRepo(t *testing.T) string {
 	t.Helper()
 
+	for _, name := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"} {
+		if old, ok := os.LookupEnv(name); ok {
+			t.Cleanup(func() { _ = os.Setenv(name, old) })
+			_ = os.Unsetenv(name)
+		}
+	}
+
 	for k, v := range map[string]string{
 		"GIT_CONFIG_NOSYSTEM": "1",
 		"GIT_CONFIG_GLOBAL":   os.DevNull,
@@ -353,5 +360,227 @@ func TestWorktreePassthroughAndFlags(t *testing.T) {
 
 	if code, _, errOut := cli(t, src, "repair", filepath.Join(parent, "wt-moved")); code != 0 {
 		t.Fatalf("repair: %d %s", code, errOut)
+	}
+}
+
+// TestAddDefaultLeavesUntracked checks the default on every platform: the
+// untracked file is not in the new worktree, status is clean, and neither
+// git nor git-cow needs --force to remove it.
+func TestAddDefaultLeavesUntracked(t *testing.T) {
+	src := newRepo(t)
+
+	if err := os.WriteFile(filepath.Join(src, "notes.txt"), []byte("mine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := filepath.Dir(src)
+
+	if code, _, errOut := cli(t, src, "add", "-b", "plain", "../plain"); code != 0 {
+		t.Fatalf("add: %d %s", code, errOut)
+	}
+
+	if _, err := os.Lstat(filepath.Join(parent, "plain", "notes.txt")); err == nil {
+		t.Error("the untracked file was carried by default")
+	}
+
+	if got := gitRun(t, filepath.Join(parent, "plain"), "status", "--porcelain"); got != "" {
+		t.Errorf("status = %q, want clean", got)
+	}
+
+	if code, _, errOut := cli(t, src, "remove", "../plain"); code != 0 {
+		t.Fatalf("remove: %d %s", code, errOut)
+	}
+
+	if body, err := os.ReadFile(filepath.Join(src, "notes.txt")); err != nil || string(body) != "mine\n" {
+		t.Errorf("the source's file: %q, %v", body, err)
+	}
+}
+
+// TestAddUntrackedFlag checks --untracked by the method the add used. When
+// files were cloned the untracked file comes along and remove needs --force.
+// When the add fell back to plain git worktree add, the flag is a no-op.
+func TestAddUntrackedFlag(t *testing.T) {
+	src := newRepo(t)
+
+	if err := os.WriteFile(filepath.Join(src, "notes.txt"), []byte("mine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, errOut := cli(t, src, "add", "--untracked", "--json", "-b", "carried", "../carried")
+	if code != 0 {
+		t.Fatalf("add --untracked: %d %s", code, errOut)
+	}
+
+	var added struct {
+		Path   string `json:"path"`
+		Method string `json:"method"`
+	}
+
+	if err := json.Unmarshal([]byte(out), &added); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("add used method %q", added.Method)
+
+	body, err := os.ReadFile(filepath.Join(added.Path, "notes.txt"))
+
+	if added.Method == cow.MethodWorktree {
+		if err == nil {
+			t.Error("the plain path carried an untracked file")
+		}
+
+		if code, _, errOut := cli(t, src, "remove", "../carried"); code != 0 {
+			t.Fatalf("remove: %d %s", code, errOut)
+		}
+
+		return
+	}
+
+	if err != nil || string(body) != "mine\n" {
+		t.Errorf("--untracked: %q, %v", body, err)
+	}
+
+	if code, _, _ := cli(t, src, "remove", "../carried"); code == 0 {
+		t.Error("remove succeeded with a carried untracked file")
+	}
+
+	if code, _, errOut := cli(t, src, "remove", "--force", "../carried"); code != 0 {
+		t.Fatalf("remove --force: %d %s", code, errOut)
+	}
+}
+
+// TestAddUntrackedHelp checks the flag is in the help text.
+func TestAddUntrackedHelp(t *testing.T) {
+	var out, errb bytes.Buffer
+
+	if code := run(context.Background(), []string{"add", "--help"}, &out, &errb); code != 0 {
+		t.Fatalf("status %d", code)
+	}
+
+	if !strings.Contains(out.String(), "--untracked") {
+		t.Errorf("help does not mention --untracked:\n%s", out.String())
+	}
+
+	out.Reset()
+	run(context.Background(), []string{"help"}, &out, &errb)
+
+	if !strings.Contains(out.String(), "--untracked") {
+		t.Errorf("usage does not mention --untracked:\n%s", out.String())
+	}
+}
+
+// TestAddRefusesRepositoryEnvironment checks that each variable which would
+// redirect Git to another repository makes add refuse, names the variable,
+// and leaves the source, index included, unchanged and no destination.
+func TestAddRefusesRepositoryEnvironment(t *testing.T) {
+	for _, name := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"} {
+		t.Run(name, func(t *testing.T) {
+			src := newRepo(t)
+
+			if err := os.WriteFile(filepath.Join(src, "notes.txt"), []byte("mine\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			value := src
+			switch name {
+			case "GIT_DIR", "GIT_COMMON_DIR":
+				value = filepath.Join(src, ".git")
+
+			case "GIT_INDEX_FILE":
+				value = filepath.Join(src, ".git", "index")
+			}
+
+			before := treeBytes(t, src)
+
+			t.Setenv(name, value)
+
+			code, _, errOut := cli(t, src, "add", "-b", "feat", "../wt")
+			if code != exitRefused {
+				t.Errorf("status %d, want %d: %s", code, exitRefused, errOut)
+			}
+
+			if !strings.Contains(errOut, name) {
+				t.Errorf("stderr %q does not name %s", errOut, name)
+			}
+
+			if _, err := os.Lstat(filepath.Join(filepath.Dir(src), "wt")); err == nil {
+				t.Error("destination was created")
+			}
+
+			if after := treeBytes(t, src); after != before {
+				t.Errorf("the source changed:\n%s\n---\n%s", before, after)
+			}
+
+			// Every other subcommand refuses too.
+			for _, sub := range []string{"list", "prune"} {
+				if code, _, errOut := cli(t, src, sub); code != exitRefused || !strings.Contains(errOut, name) {
+					t.Errorf("%s: status %d: %s", sub, code, errOut)
+				}
+			}
+
+			if code, _, errOut := cli(t, src, "copy", ".", "../copy"); code != exitRefused || !strings.Contains(errOut, name) {
+				t.Errorf("copy: status %d: %s", code, errOut)
+			}
+		})
+	}
+}
+
+// treeBytes returns every file under dir, the Git directory and its index
+// included, as one string of paths and contents, except the Git directory's
+// lock and log churn that reading cannot cause.
+func treeBytes(t *testing.T, dir string) string {
+	t.Helper()
+
+	var b strings.Builder
+
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+
+		rel, _ := filepath.Rel(dir, p)
+		fmt.Fprintf(&b, "%s %d %x\n", rel, len(data), data)
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return b.String()
+}
+
+// TestGitDashCExportsNoRepositoryEnvironment checks the premise of the
+// refusal: git runs an external subcommand given only -C, or from inside a
+// checkout, without exporting any of the variables, so "git -C <repo> cow"
+// keeps working.
+func TestGitDashCExportsNoRepositoryEnvironment(t *testing.T) {
+	src := newRepo(t)
+	bin := t.TempDir()
+
+	script := "#!/bin/sh\nenv | grep -E '^GIT_(DIR|WORK_TREE|INDEX_FILE|COMMON_DIR)=' || true\npwd\n"
+	if err := os.WriteFile(filepath.Join(bin, "git-cow"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	for _, args := range [][]string{{"-C", src, "cow"}, {"cow"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = src
+
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+
+		if strings.Contains(string(out), "GIT_") {
+			t.Errorf("git %v exported a repository variable:\n%s", args, out)
+		}
 	}
 }
